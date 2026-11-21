@@ -14,10 +14,11 @@
 #   tools/test-bench.sh down         remove the containers and the podman root
 #
 # Settings: BENCH_PREFIX (names, default frappe-auction-test), BENCH_PORT_BASE (default 48500: MariaDB, Redis,
-# desk), BENCH_PODMAN_ROOT (default /tmp/$BENCH_PREFIX), BENCH_IMAGES (directories of `podman load` archives,
-# colon-separated; every *.tar in them is loaded; on the runners /var/cache/runner/images/erpnext-v16.36.1 and
-# /var/cache/runner/images/erpnext-v16.36.1-payments-cca07d9), BENCH_ERPNEXT_IMAGE (default the official ERPNext
-# image; localhost/erpnext-payments:v16.36.1-cca07d9 is the same with the payments app in it).
+# desk), BENCH_PODMAN_ROOT (default /tmp/$BENCH_PREFIX), BENCH_IMAGES (colon-separated `podman load` archives,
+# or published set directories whose every *.tar is loaded), BENCH_ERPNEXT_IMAGE (default the official ERPNext
+# image). On the runners, prod parity is the MariaDB and Redis archives of /var/cache/runner/images/erpnext-v16.36.1
+# plus the set /var/cache/runner/images/erpnext-v16.50.0-frappe-v16.51.1-payments-cca07d9, with
+# BENCH_ERPNEXT_IMAGE=localhost/erpnext-prod:v16.50.0-f2871914-pcca07d9.
 main() {
 	set -euo pipefail
 	local root prefix podman_root db redis bench site port_base db_port redis_port serve_port
@@ -57,7 +58,8 @@ main() {
 		git -C "$root" ls-files -z --cached --others --exclude-standard \
 			| tar -C "$root" --null -T - -cf - \
 			| pod exec -i -u root "$bench" tar -C "$app_dir" -xf -
-		pod exec -u root "$bench" chown -R frappe:frappe "$app_dir"
+		# The frappe user's group is named differently across ERPNext images; use its ids.
+		pod exec -u root "$bench" sh -c "chown -R \"\$(id -u frappe):\$(id -g frappe)\" '$app_dir'"
 	}
 
 	mkdir -p "$podman_root"
@@ -71,6 +73,11 @@ main() {
 		if [ -n "${BENCH_IMAGES:-}" ]; then
 			IFS=: read -ra image_dirs <<<"$BENCH_IMAGES"
 			for images_dir in "${image_dirs[@]}"; do
+				if [ -f "$images_dir" ]; then
+					[ -e "$(dirname "$images_dir")/.DONE" ] || { echo "$images_dir isn't in a published set" >&2; exit 1; }
+					pod load --quiet -i "$images_dir" >/dev/null
+					continue
+				fi
 				[ -e "$images_dir/.DONE" ] || { echo "no published image set at $images_dir" >&2; exit 1; }
 				for archive in "$images_dir"/*.tar; do
 					pod load --quiet -i "$archive" >/dev/null
