@@ -1,0 +1,17 @@
+{#- SPDX-License-Identifier: AGPL-3.0-or-later -#}
+<button class="btn btn-primary razorpay-hold" type="button">{{ _("Authorize") }}</button>
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+<script>
+	(() => {
+		const checkout = new Razorpay({
+			key: {{ page.key | tojson }},
+			order_id: {{ page.order_id | tojson }},
+			amount: {{ page.amount | tojson }},
+			currency: {{ page.currency | tojson }},
+			description: {{ page.description | tojson }},
+			prefill: { email: {{ page.email | tojson }} },
+			handler: (response) => window.auctionConfirmHold(response),
+		});
+		document.querySelector(".razorpay-hold").addEventListener("click", () => checkout.open());
+	})();
+</script>

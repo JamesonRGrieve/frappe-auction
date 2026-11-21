@@ -1,0 +1,19 @@
+{#- SPDX-License-Identifier: AGPL-3.0-or-later -#}
+<div class="braintree-dropin mb-3"></div>
+<button class="btn btn-primary braintree-hold" type="button">{{ _("Authorize") }}</button>
+<script src="https://js.braintreegateway.com/web/dropin/1.43.0/js/dropin.min.js"></script>
+<script>
+	braintree.dropin.create({ authorization: {{ page.client_token | tojson }}, container: ".braintree-dropin" }).then((dropin) => {
+		const button = document.querySelector(".braintree-hold");
+		button.addEventListener("click", () => {
+			button.disabled = true;
+			dropin
+				.requestPaymentMethod()
+				.then((method) => window.auctionConfirmHold({ nonce: method.nonce }))
+				.catch((error) => {
+					document.querySelector(".auction-hold-error").textContent = error.message;
+					button.disabled = false;
+				});
+		});
+	});
+</script>

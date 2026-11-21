@@ -1,0 +1,25 @@
+{#- SPDX-License-Identifier: AGPL-3.0-or-later -#}
+<form class="stripe-hold">
+	<div class="stripe-card form-control mb-3" style="height: auto; padding: 0.75rem"></div>
+	<button class="btn btn-primary" type="submit">{{ _("Authorize") }}</button>
+</form>
+<script src="https://js.stripe.com/v3/"></script>
+<script>
+	(() => {
+		const stripe = Stripe({{ page.publishable_key | tojson }});
+		const card = stripe.elements().create("card");
+		card.mount(".stripe-card");
+		const form = document.querySelector(".stripe-hold");
+		form.addEventListener("submit", async (event) => {
+			event.preventDefault();
+			form.querySelector("button").disabled = true;
+			const result = await stripe.confirmCardPayment({{ page.client_secret | tojson }}, { payment_method: { card } });
+			if (result.error) {
+				document.querySelector(".auction-hold-error").textContent = result.error.message;
+				form.querySelector("button").disabled = false;
+				return;
+			}
+			window.auctionConfirmHold({});
+		});
+	})();
+</script>

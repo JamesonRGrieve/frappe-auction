@@ -1,0 +1,11 @@
+{#- SPDX-License-Identifier: AGPL-3.0-or-later -#}
+{% if frappe.form_dict.paypal == "return" and frappe.form_dict.token %}
+<p>{{ _("Confirming with PayPal…") }}</p>
+<script>
+	window.addEventListener("load", () =>
+		window.auctionConfirmHold({ token: {{ frappe.form_dict.token | tojson }}, PayerID: {{ (frappe.form_dict.PayerID or "") | tojson }} }),
+	);
+</script>
+{% else %}
+<a class="btn btn-primary" href="{{ page.approve_url | e }}">{{ _("Authorize with PayPal") }}</a>
+{% endif %}

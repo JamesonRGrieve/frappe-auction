@@ -12,7 +12,8 @@ from typing import Any
 import frappe
 from frappe import _
 
-from auction import engine
+from auction import engine, holds
+from auction.gateways.base import HoldRefused
 from auction.rules import BidRejected
 
 SELLER_ROLES = ("Sales Manager", "System Manager")
@@ -78,3 +79,23 @@ def decline_offer(bid: str) -> None:
 	frappe.only_for(SELLER_ROLES)
 	with _refusals(_("Offer not declined")):
 		engine.decline_offer(bid)
+
+
+@frappe.whitelist(methods=["POST"])
+def confirm_hold(bid: str, **payload: Any) -> dict[str, Any]:
+	"""The buyer's gateway form finished: check with the gateway that the amount is held, then let the row
+	count (or fail it, with the gateway's reason)."""
+	payload.pop("cmd", None)
+	row = frappe.get_doc("Auction Bid", bid)
+	if row.bidder != frappe.session.user:
+		raise frappe.PermissionError
+	auction = frappe.get_doc("Auction", row.auction)
+	adapter = holds.require_provider(auction.payment_gateway_account)
+	hold = holds.hold_request(auction, row)
+	try:
+		reference = adapter.confirm(hold, payload)
+	except HoldRefused as refused:
+		engine.hold_failed(bid, str(refused))
+		return {"ok": False, "error": str(refused), "return_url": hold.return_url}
+	engine.hold_authorized(bid, reference)
+	return {"ok": True, "return_url": hold.return_url}

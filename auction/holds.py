@@ -4,7 +4,8 @@ offer, the hold is captured when they win, and released when they are outbid or 
 
 Holds go through the site's payment gateways (the ``payments`` app's Payment Gateway), and no gateway is
 named here. A gateway supports holds when its controller (``payments.utils.get_payment_gateway_controller``,
-the gateway's settings document) has these members:
+the gateway's settings document) has the members below, or when ``auction.gateways`` has an adapter for it
+(the payments app's own gateways):
 
 ``max_hold_days`` (int)
     How long the gateway keeps an authorization. An auction longer than this can't hold payments.
@@ -15,7 +16,7 @@ on_authorized, on_failed, return_url) -> str``
     ``frappe.get_attr(on_failed)(reference_docname, reason)``. Then it sends the buyer to ``return_url``.
 ``release_hold(hold_reference) -> None``
     Lets the authorization go.
-``capture_hold(hold_reference, amount) -> str``
+``capture_hold(hold_reference, amount, currency) -> str``
     Takes up to the authorized amount; returns the gateway's transaction id.
 """
 
@@ -45,7 +46,9 @@ def provider_for(payment_gateway_account: str | None) -> Any | None:
 	controller = get_payment_gateway_controller(gateway)
 	if all(callable(getattr(controller, method, None)) for method in HOLD_METHODS):
 		return controller
-	return None
+	from auction.gateways import adapter_for
+
+	return adapter_for(controller)
 
 
 def require_provider(payment_gateway_account: str | None) -> Any:
@@ -81,4 +84,20 @@ def release(auction: Any, hold_reference: str) -> None:
 
 
 def capture(auction: Any, hold_reference: str, amount: Decimal) -> str:
-	return require_provider(auction.payment_gateway_account).capture_hold(hold_reference, flt(amount))
+	return require_provider(auction.payment_gateway_account).capture_hold(hold_reference, flt(amount), auction.currency)
+
+
+def hold_request(auction: Any, row: Any) -> Any:
+	"""The row's hold as an adapter sees it (``auction.gateways.base.HoldRequest``)."""
+	from auction.gateways.base import HoldRequest, hold_page_url
+
+	return HoldRequest(
+		name=row.name,
+		amount=Decimal(str(flt(row.hold_amount))),
+		currency=auction.currency,
+		description=_("Held for your {0} on {1}").format(_(row.bid_type).lower(), auction.title),
+		payer_email=row.bidder,
+		reference=row.hold_reference or None,
+		return_url=get_url(f"/{auction.route}"),
+		hold_url=hold_page_url(row.name),
+	)

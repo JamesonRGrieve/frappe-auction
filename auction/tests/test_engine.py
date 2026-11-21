@@ -406,7 +406,7 @@ class FakeGateway:
 	def release_hold(self, hold_reference: str) -> None:
 		self.released.append(hold_reference)
 
-	def capture_hold(self, hold_reference: str, amount: float) -> str:
+	def capture_hold(self, hold_reference: str, amount: float, currency: str) -> str:
 		self.captured.append((hold_reference, amount))
 		return f"txn-{hold_reference}"
 
@@ -529,6 +529,39 @@ class TestHolds(AuctionTestCase):
 		self.authorize(auction, "ann")
 		self.assertEqual(self.reload(auction).status, engine.SOLD)
 		self.assertEqual(self.gateway.captured, [("ref-ann", 80.0)])
+
+	def test_the_hold_page_confirm_checks_with_the_gateway(self) -> None:
+		from auction import api
+		from auction.gateways.stripe import API, StripeHolds
+		from auction.tests.gateway_replay import Controller, Replay, exchange
+
+		auction = self.held(rules.ENGLISH)
+		self.bid(auction, "ann", "50")
+		row = self.row(auction, "ann")
+		row.db_set("hold_reference", "pi_ann")
+		held = {"id": "pi_ann", "amount": 5000, "status": "requires_capture", "metadata": {"auction_bid": row.name}}
+		unfinished = held | {"status": "requires_payment_method"}
+		replay = Replay(
+			exchange("GET", f"{API}/payment_intents/pi_ann", unfinished),
+			exchange("GET", f"{API}/payment_intents/pi_ann", held),
+		)
+		stripe = StripeHolds(Controller("Stripe Settings", {"secret_key": "sk"}), transport=replay)
+		with patch("auction.holds.provider_for", return_value=stripe):
+			frappe.set_user(user("ann"))
+			try:
+				refused = api.confirm_hold(row.name)
+				self.assertFalse(refused["ok"])
+				self.assertEqual(self.row(auction, "ann").hold_status, engine.FAILED)
+				self.bid(auction, "ann", "50")
+				second = self.row(auction, "ann")
+				second.db_set("hold_reference", "pi_ann")
+				replay.pending[0]["response"]["metadata"]["auction_bid"] = second.name
+				self.assertTrue(api.confirm_hold(second.name)["ok"])
+			finally:
+				frappe.set_user("Administrator")
+		self.assertEqual(self.row(auction, "ann").hold_status, engine.AUTHORIZED)
+		self.assertEqual(self.reload(auction).bid_count, 1)
+		replay.assert_done()
 
 	def test_an_auction_longer_than_the_gateway_holds_is_refused(self) -> None:
 		with self.assertRaisesRegex(frappe.ValidationError, "7 days"):

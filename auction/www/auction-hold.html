@@ -1,0 +1,34 @@
+{#- SPDX-License-Identifier: AGPL-3.0-or-later -#}
+{% extends "templates/web.html" %}
+
+{% block page_content %}
+<div class="auction-hold" data-bid="{{ row.name | e }}" data-return="/{{ auction.route | e }}">
+	<h1 class="h3">{{ _("Authorize your card") }}</h1>
+	<p><a href="/{{ auction.route | e }}">{{ auction.title | e }}</a></p>
+	{% if waiting %}
+	<p>{{ _("We hold {0} on your card for your {1}. It's charged only if you win, and released if you don't.").format(
+		frappe.format(hold.amount, {"fieldtype": "Currency", "options": hold.currency}), _(row.bid_type).lower()) }}</p>
+	{% include hold_template %}
+	<p class="auction-hold-error text-danger mt-3" role="alert"></p>
+	{% else %}
+	<p>{{ _("This hold is already {0}.").format(_(row.hold_status).lower()) }}</p>
+	{% endif %}
+</div>
+{% endblock %}
+
+{% block script %}
+<script>
+	// Sends what the gateway's form produced to the server, which checks it with the gateway.
+	window.auctionConfirmHold = (payload) =>
+		frappe
+			.call({
+				method: "auction.api.confirm_hold",
+				args: { bid: document.querySelector(".auction-hold").dataset.bid, ...payload },
+				type: "POST",
+			})
+			.then((r) => {
+				if (r.message && r.message.ok) window.location.assign(r.message.return_url);
+				else document.querySelector(".auction-hold-error").textContent = (r.message && r.message.error) || "";
+			});
+</script>
+{% endblock %}
