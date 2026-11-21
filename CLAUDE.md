@@ -30,8 +30,9 @@ with its own web page, settled into submitted Sales Orders. Standards live in th
 
 - `tools/test-bench.sh up|test [--no-migrate]|serve|down`: rootless podman with the root on local `/tmp`, host
   network, three ports from `BENCH_PORT_BASE`. On the runners load the shared sets
-  (`BENCH_IMAGES=/var/cache/runner/images/erpnext-v16.36.1:/var/cache/runner/images/erpnext-v16.36.1-payments-cca07d9`,
-  `BENCH_ERPNEXT_IMAGE=localhost/erpnext-payments:v16.36.1-cca07d9`); this card owns both sets. Runner jobs follow
+  (`BENCH_IMAGES=/var/cache/runner/images/mariadb-11.8-redis-7:/var/cache/runner/images/erpnext-v16.50.0-frappe-v16.51.1-payments-cca07d9`,
+  `BENCH_ERPNEXT_IMAGE=localhost/erpnext-prod:v16.50.0-f2871914-pcca07d9`: prod's frappe, erpnext and payments
+  pins); this card owns both sets. Runner jobs follow
   the Build Runner Budget (15-minute cap, BUILD START/DONE to the slot manager).
 - `tests/test_engine.py` runs on the real ERPNext test DB. `open_and_close_due` commits, so tests use their own
   lot item and clear its auctions in `setUp`. Engine calls take `now` so tests set the clock.

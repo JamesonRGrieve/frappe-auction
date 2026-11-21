@@ -13,16 +13,20 @@
 #   tools/test-bench.sh serve        serve the site's desk on http://127.0.0.1:$((BENCH_PORT_BASE + 2))
 #   tools/test-bench.sh down         remove the containers and the podman root
 #
+# BENCH_APP (default auction) and BENCH_SOURCE (default this repo) test another app's working tree the same way,
+# e.g. BENCH_APP=payment_square BENCH_SOURCE=/home/jameson/Source/frappe-payment-square.
+#
 # Settings: BENCH_PREFIX (names, default frappe-auction-test), BENCH_PORT_BASE (default 48500: MariaDB, Redis,
 # desk), BENCH_PODMAN_ROOT (default /tmp/$BENCH_PREFIX), BENCH_IMAGES (colon-separated `podman load` archives,
 # or published set directories whose every *.tar is loaded), BENCH_ERPNEXT_IMAGE (default the official ERPNext
-# image). On the runners, prod parity is the MariaDB and Redis archives of /var/cache/runner/images/erpnext-v16.36.1
-# plus the set /var/cache/runner/images/erpnext-v16.50.0-frappe-v16.51.1-payments-cca07d9, with
+# image). On the runners, prod parity is the sets /var/cache/runner/images/mariadb-11.8-redis-7 and
+# /var/cache/runner/images/erpnext-v16.50.0-frappe-v16.51.1-payments-cca07d9, with
 # BENCH_ERPNEXT_IMAGE=localhost/erpnext-prod:v16.50.0-f2871914-pcca07d9.
 main() {
 	set -euo pipefail
 	local root prefix podman_root db redis bench site port_base db_port redis_port serve_port
-	root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+	root="${BENCH_SOURCE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+	local app="${BENCH_APP:-auction}"
 	prefix="${BENCH_PREFIX:-frappe-auction-test}"
 	podman_root="${BENCH_PODMAN_ROOT:-/tmp/$prefix}"
 	db="$prefix-db"
@@ -39,7 +43,7 @@ main() {
 	local db_root_password="bench-root"
 	local admin_password="bench-admin"
 	local db_ready_attempts=120
-	local app_dir="/home/frappe/frappe-bench/apps/auction"
+	local app_dir="/home/frappe/frappe-bench/apps/$app"
 	# Payment holds go through the payments app's gateways; the ERPNext image doesn't ship it.
 	local payments_repo="https://github.com/frappe/payments"
 	local payments_branch="version-16"
@@ -109,18 +113,18 @@ main() {
 		in_bench bench set-config -g redis_cache "redis://127.0.0.1:$redis_port/0"
 		in_bench bench set-config -g redis_queue "redis://127.0.0.1:$redis_port/1"
 		in_bench bench set-config -g redis_socketio "redis://127.0.0.1:$redis_port/2"
-		in_bench ./env/bin/python -m pip install --quiet -e apps/auction
+		in_bench ./env/bin/python -m pip install --quiet -e "apps/$app"
 		if ! in_bench test -d apps/payments; then
 			in_bench bench get-app --skip-assets --branch "$payments_branch" payments "$payments_repo"
 		fi
 		# sites/ is a volume, so an image with payments baked in doesn't carry it in apps.txt.
 		in_bench bash -c 'grep -qx payments sites/apps.txt || printf "\npayments\n" >> sites/apps.txt'
 		# The image's apps.txt has no final newline.
-		in_bench bash -c 'grep -qx auction sites/apps.txt || printf "\nauction\n" >> sites/apps.txt'
+		in_bench bash -c "grep -qx $app sites/apps.txt || printf '\\n%s\\n' $app >> sites/apps.txt"
 		in_bench bench new-site "$site" --mariadb-root-password "$db_root_password" \
 			--admin-password "$admin_password" --mariadb-user-host-login-scope='%' --install-app erpnext
 		in_bench bench --site "$site" install-app payments
-		in_bench bench --site "$site" install-app auction
+		in_bench bench --site "$site" install-app "$app"
 		in_bench bench --site "$site" set-config allow_tests true
 		;;
 	test)
@@ -128,7 +132,7 @@ main() {
 		if [ "${2:-}" != "--no-migrate" ]; then
 			in_bench bench --site "$site" migrate
 		fi
-		in_bench bench --site "$site" run-tests --app auction
+		in_bench bench --site "$site" run-tests --app "$app"
 		;;
 	serve)
 		# The image keeps its built assets beside sites/, which is a volume, so the link to them is missing.

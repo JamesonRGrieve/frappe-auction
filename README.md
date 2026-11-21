@@ -88,14 +88,19 @@ tools/test-bench.sh down
 The bench installs the `payments` app (version-16) when the image lacks it. Run the bench on a build runner,
 never a desktop. `BENCH_PORT_BASE` picks the three ports it uses (MariaDB, Redis,
 desk). `BENCH_IMAGES` names a directory of saved images (`erpnext_v16.36.1.tar`, `mariadb_11.8.tar`,
-`redis_7-alpine.tar`); on the build runners they are in `/var/cache/runner/images/erpnext-v16.36.1`. Without it
+`redis_7-alpine.tar`, or single archive paths); on the build runners prod parity is
+`/var/cache/runner/images/mariadb-11.8-redis-7` plus `/var/cache/runner/images/erpnext-v16.50.0-frappe-v16.51.1-payments-cca07d9`
+with `BENCH_ERPNEXT_IMAGE=localhost/erpnext-prod:v16.50.0-f2871914-pcca07d9`. Without it
 podman pulls the images itself.
 
 ## Not done yet
 
 - The Payment Request path (After Close with a gateway) isn't exercised by a test; holds are, against an
   in-memory gateway.
-- No gateway implements the hold contract yet (frappe-payment-square and frappe-payment-helcim are candidates).
+- Holds by gateway: Stripe, Braintree, PayPal and Razorpay through this app's adapters (`auction/gateways/`);
+  Square and Helcim through their own apps (frappe-payment-square, frappe-payment-helcim). M-Pesa and GoCardless
+  can't hold. Paymob needs a separate Auth/Capture integration and Paytm its enterprise pre-auth before an adapter.
+  None has run against a live gateway account yet; each gateway's go-live gate lists the hold round trips.
 - No second-chance offer to the runner-up when a winner doesn't pay.
 - Staff can read sealed bids in the desk before the close.
 - A buyer isn't emailed when their offer is declined; the auction page shows it.
