@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""/auction-hold?bid=<Auction Bid>: where a buyer authorizes the hold for their own bid, purchase or offer,
+"""/auction-hold?bid=<Auction Bid> (this module is auction_hold.py: Frappe finds a www page's controller by its
+name with "-" turned into "_"): where a buyer authorizes the hold for their own bid, purchase or offer,
 through the auction gateway's card form (an ``auction.gateways`` adapter)."""
 
 from __future__ import annotations

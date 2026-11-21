@@ -411,27 +411,32 @@ class FakeGateway:
 		return f"txn-{hold_reference}"
 
 
+def ensure_gateway_account() -> str:
+	"""A Payment Gateway Account on a gateway with no controller of its own; tests patch auction.holds.provider_for."""
+	if not frappe.db.exists("Payment Gateway", GATEWAY):
+		frappe.get_doc({"doctype": "Payment Gateway", "gateway": GATEWAY}).insert(ignore_permissions=True)
+	account = frappe.db.get_value("Payment Gateway Account", {"payment_gateway": GATEWAY})
+	if not account:
+		account = (
+			frappe.get_doc(
+				{
+					"doctype": "Payment Gateway Account",
+					"payment_gateway": GATEWAY,
+					"payment_account": GATEWAY_PAYMENT_ACCOUNT,
+					"company": COMPANY,
+				}
+			)
+			.insert(ignore_permissions=True)
+			.name
+		)
+	frappe.db.commit()
+	return account
+
+
 class TestHolds(AuctionTestCase):
 	def setUp(self) -> None:
 		super().setUp()
-		if not frappe.db.exists("Payment Gateway", GATEWAY):
-			frappe.get_doc({"doctype": "Payment Gateway", "gateway": GATEWAY}).insert(ignore_permissions=True)
-		account = frappe.db.get_value("Payment Gateway Account", {"payment_gateway": GATEWAY})
-		if not account:
-			account = (
-				frappe.get_doc(
-					{
-						"doctype": "Payment Gateway Account",
-						"payment_gateway": GATEWAY,
-						"payment_account": GATEWAY_PAYMENT_ACCOUNT,
-						"company": COMPANY,
-					}
-				)
-				.insert(ignore_permissions=True)
-				.name
-			)
-		self.account = account
-		frappe.db.commit()
+		self.account = ensure_gateway_account()
 		self.gateway = FakeGateway()
 		patcher = patch("auction.holds.provider_for", return_value=self.gateway)
 		patcher.start()

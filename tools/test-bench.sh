@@ -56,11 +56,12 @@ main() {
 		pod exec -i -w /home/frappe/frappe-bench "$bench" "$@"
 	}
 
-	# The working tree (tracked and untracked files, nothing ignored) replaces the app's source in the bench.
+	# The working tree (tracked and untracked files, nothing ignored) replaces the app's source in the bench. A file
+	# deleted but not yet committed is still listed by git; tar skips it.
 	copy_app() {
 		pod exec -u root "$bench" mkdir -p "$app_dir"
 		git -C "$root" ls-files -z --cached --others --exclude-standard \
-			| tar -C "$root" --null -T - -cf - \
+			| tar -C "$root" --null --ignore-failed-read -T - -cf - \
 			| pod exec -i -u root "$bench" tar -C "$app_dir" -xf -
 		# The frappe user's group is named differently across ERPNext images; use its ids.
 		pod exec -u root "$bench" sh -c "chown -R \"\$(id -u frappe):\$(id -g frappe)\" '$app_dir'"
@@ -126,6 +127,8 @@ main() {
 		in_bench bench --site "$site" install-app payments
 		in_bench bench --site "$site" install-app "$app"
 		in_bench bench --site "$site" set-config allow_tests true
+		# The image keeps its built assets beside sites/, which is a volume; pages need the link to find them.
+		in_bench ln -sfn /home/frappe/frappe-bench/assets sites/assets
 		;;
 	test)
 		copy_app
@@ -135,8 +138,6 @@ main() {
 		in_bench bench --site "$site" run-tests --app "$app"
 		;;
 	serve)
-		# The image keeps its built assets beside sites/, which is a volume, so the link to them is missing.
-		in_bench ln -sfn /home/frappe/frappe-bench/assets sites/assets
 		# A fresh site sends every System Manager to the setup wizard; mark it set up so the desk opens.
 		in_bench bench --site "$site" console <<-'PYTHON' >/dev/null
 			frappe.db.sql("update `tabInstalled Application` set is_setup_complete = 1")

@@ -29,6 +29,9 @@ TERMS_FIELDS = (
 )
 SECONDS_PER_DAY = 86400
 ROUTE_SUFFIX_LENGTH = 6
+# The DocType has no `route` of its own: Frappe would then add a route rule sending /auctions to its generic
+# list renderer instead of www/auctions.html. Pages are routed here instead.
+ROUTE_PREFIX = "auctions"
 
 
 class Auction(WebsiteGenerator):
@@ -107,7 +110,7 @@ class Auction(WebsiteGenerator):
 
 	def make_route(self) -> str:
 		# Titles repeat ("Pokemon booster box"), so the route carries part of the random name.
-		return f"{super().make_route()}-{self.name[:ROUTE_SUFFIX_LENGTH]}"
+		return f"{ROUTE_PREFIX}/{self.scrubbed_title()}-{self.name[:ROUTE_SUFFIX_LENGTH]}"
 
 	def get_context(self, context: frappe._dict) -> None:
 		context.no_cache = 1

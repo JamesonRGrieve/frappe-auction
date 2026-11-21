@@ -445,7 +445,7 @@
    "link_fieldname": "auction"
   }
  ],
- "modified": "2026-11-21 18:00:00.000000",
+ "modified": "2026-11-21 20:15:00.000000",
  "modified_by": "Administrator",
  "module": "Auction",
  "name": "Auction",
@@ -471,7 +471,6 @@
    "role": "Sales User"
   }
  ],
- "route": "auctions",
  "sort_field": "starts_at",
  "sort_order": "DESC",
  "states": [],
