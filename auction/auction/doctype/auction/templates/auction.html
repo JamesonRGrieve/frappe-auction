@@ -1,0 +1,176 @@
+{#- SPDX-License-Identifier: AGPL-3.0-or-later -#}
+{% extends "templates/web.html" %}
+
+{% block page_content %}
+<div class="auction-page" data-auction="{{ doc.name | e }}">
+	<div class="row">
+		{% if doc.image %}
+		<div class="col-md-5 mb-4">
+			<img class="img-fluid rounded" src="{{ doc.image | e }}" alt="{{ doc.title | e }}">
+		</div>
+		{% endif %}
+		<div class="{{ 'col-md-7' if doc.image else 'col-12' }}">
+			<h1>{{ doc.title | e }}</h1>
+			<p class="text-muted">
+				{{ _(doc.auction_type) }} {{ _("auction") }}
+				{% if doc.auction_type == "Sealed" %}
+				· {{ _("bids stay hidden until the close") }}
+				{% elif doc.auction_type == "Dutch" %}
+				· {{ _("the price drops until someone buys") }}
+				{% endif %}
+				{% if doc.quantity != 1 %} · {{ _("Quantity") }}: {{ doc.get_formatted("quantity") }}{% endif %}
+			</p>
+
+			<div class="auction-panel card p-3 mb-4" aria-live="polite">
+				<div class="auction-status h5 mb-2"></div>
+				<div class="auction-price display-6 mb-1"></div>
+				<div class="auction-note text-muted mb-3"></div>
+				<form class="auction-form" hidden>
+					<label class="form-label auction-input-label" for="auction-input"></label>
+					<div class="input-group">
+						<input id="auction-input" class="form-control auction-input" type="number" min="0" step="any" required>
+						<button class="btn btn-primary auction-submit" type="submit"></button>
+					</div>
+				</form>
+				<a class="auction-sign-in btn btn-primary" href="/login?redirect-to=/{{ doc.route | e }}" hidden>{{ _("Sign in to take part") }}</a>
+				<div class="auction-own small mt-2"></div>
+			</div>
+
+			{% if doc.description %}
+			<div class="auction-description">{{ doc.description }}</div>
+			{% endif %}
+		</div>
+	</div>
+</div>
+{% endblock %}
+
+{% block script %}
+<script>
+(() => {
+	const POLL_MS = 5000;
+	const TICK_MS = 1000;
+	const root = document.querySelector(".auction-page");
+	const el = (name) => root.querySelector(`.auction-${name}`);
+	const t = (text) => (window.__ ? __(text) : text);
+	let state = {{ state | tojson }};
+	let loadedAt = Date.now();
+
+	const money = (value) =>
+		value === null || value === undefined
+			? ""
+			: new Intl.NumberFormat(undefined, { style: "currency", currency: state.currency }).format(value);
+
+	const elapsed = () => Math.floor((Date.now() - loadedAt) / 1000);
+
+	const duration = (seconds) => {
+		const d = Math.floor(seconds / 86400);
+		const h = Math.floor((seconds % 86400) / 3600);
+		const m = Math.floor((seconds % 3600) / 60);
+		const s = seconds % 60;
+		return [d && `${d}d`, (d || h) && `${h}h`, `${m}m`, `${s}s`].filter(Boolean).join(" ");
+	};
+
+	// The Dutch price falls one step per interval from the state's price; computed here between polls.
+	const dutchPrice = () => {
+		if (state.status !== "Open" || !state.seconds_to_next_step) return state.current_price;
+		const passed = elapsed();
+		if (passed < state.seconds_to_next_step) return state.current_price;
+		const steps = 1 + Math.floor((passed - state.seconds_to_next_step) / state.step_interval_seconds);
+		return Math.max(state.floor_price, state.current_price - steps * state.price_step);
+	};
+
+	const render = () => {
+		const toStart = Math.max(0, state.seconds_to_start - elapsed());
+		const toEnd = Math.max(0, state.seconds_to_end - elapsed());
+		const live = state.open && toStart === 0 && toEnd > 0;
+		const type = state.auction_type;
+
+		let status;
+		if (state.status === "Sold" || state.status === "Unsold") status = t(state.status);
+		else if (toStart > 0) status = `${t("Starts in")} ${duration(toStart)}`;
+		else if (toEnd > 0) status = `${t("Ends in")} ${duration(toEnd)}`;
+		else status = t("Closing…");
+		el("status").textContent = status;
+
+		let price = "";
+		let note = "";
+		if (type === "English") {
+			price = state.current_price === null ? money(state.minimum_bid) : money(state.current_price);
+			note = state.current_price === null ? t("Starting bid") : `${state.bid_count} ${t("bids")}`;
+			if (state.reserve_met === false) note += ` · ${t("reserve not met")}`;
+		} else if (type === "Sealed") {
+			price = state.current_price ? money(state.current_price) : "";
+			note = state.current_price
+				? t("Winning price")
+				: `${t("Lowest bid")} ${money(state.minimum_bid)} · ${state.bid_count} ${t("bids")}`;
+		} else {
+			price = money(dutchPrice());
+			note = `${state.units_left} ${t("left")} · ${t("floor")} ${money(state.floor_price)}`;
+		}
+		el("price").textContent = price;
+		el("note").textContent = note;
+
+		const form = el("form");
+		form.hidden = !(live && state.signed_in);
+		el("sign-in").hidden = !(live && !state.signed_in);
+		if (type === "Dutch") {
+			el("input-label").textContent = t("Units");
+			el("submit").textContent = `${t("Buy now at")} ${money(dutchPrice())}`;
+			el("input").step = "1";
+			el("input").min = "1";
+			el("input").max = String(state.units_left);
+			if (!el("input").value) el("input").value = "1";
+		} else {
+			el("input-label").textContent = type === "English" ? t("Your maximum bid") : t("Your sealed bid");
+			el("submit").textContent = t("Place bid");
+			el("input").min = String(state.minimum_bid);
+		}
+
+		const own = [];
+		if (state.you_lead) own.push(t("You are the highest bidder."));
+		if (state.your_max) own.push(`${t("Your maximum")}: ${money(state.your_max)}`);
+		if (state.your_bid) own.push(`${t("Your bid")}: ${money(state.your_bid)}`);
+		if (state.you_bought) own.push(`${t("You bought")} ${state.you_bought}`);
+		if (state.you_won) own.push(t("You won. Your order and payment details are on their way."));
+		el("own").textContent = own.join(" ");
+	};
+
+	const refresh = () =>
+		frappe
+			.call({ method: "auction.api.get_state", args: { auction: root.dataset.auction }, type: "GET" })
+			.then((r) => {
+				state = r.message;
+				loadedAt = Date.now();
+				render();
+			});
+
+	el("form").addEventListener("submit", (event) => {
+		event.preventDefault();
+		const value = el("input").value;
+		const dutch = state.auction_type === "Dutch";
+		el("submit").disabled = true;
+		frappe
+			.call({
+				method: dutch ? "auction.api.accept_price" : "auction.api.place_bid",
+				args: dutch ? { auction: root.dataset.auction, qty: value } : { auction: root.dataset.auction, amount: value },
+				type: "POST",
+			})
+			.then((r) => {
+				if (r.message) {
+					state = r.message;
+					loadedAt = Date.now();
+					el("input").value = dutch ? "1" : "";
+					render();
+				}
+			})
+			.always(() => {
+				el("submit").disabled = false;
+			});
+	});
+
+	render();
+	setInterval(render, TICK_MS);
+	setInterval(refresh, POLL_MS);
+})();
+</script>
+{% endblock %}

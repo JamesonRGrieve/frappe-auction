@@ -1,0 +1,29 @@
+{#- SPDX-License-Identifier: AGPL-3.0-or-later -#}
+{% extends "templates/web.html" %}
+
+{% block page_content %}
+<h1 class="mb-4">{{ _("Auctions") }}</h1>
+{% if auctions %}
+<div class="row">
+	{% for auction in auctions %}
+	<div class="col-sm-6 col-lg-4 mb-4">
+		<a class="card h-100 text-reset text-decoration-none" href="/{{ auction.route | e }}">
+			{% if auction.image %}
+			<img class="card-img-top" src="{{ auction.image | e }}" alt="{{ auction.title | e }}">
+			{% endif %}
+			<div class="card-body">
+				<h2 class="h5 card-title">{{ auction.title | e }}</h2>
+				<p class="card-text text-muted mb-1">{{ _(auction.auction_type) }} · {{ _(auction.status) }}</p>
+				<p class="card-text small mb-0">
+					{% if auction.status == "Scheduled" %}{{ _("Starts") }} {{ frappe.format(auction.starts_at, {"fieldtype": "Datetime"}) }}
+					{% else %}{{ _("Ends") }} {{ frappe.format(auction.ends_at, {"fieldtype": "Datetime"}) }}{% endif %}
+				</p>
+			</div>
+		</a>
+	</div>
+	{% endfor %}
+</div>
+{% else %}
+<p class="text-muted">{{ _("No auctions are running right now.") }}</p>
+{% endif %}
+{% endblock %}
