@@ -96,6 +96,11 @@ class AuctionTestCase(ERPNextTestSuite):
 			doc |= {"bid_increment": 1, "extend_window_minutes": 2}
 		elif auction_type == rules.SEALED:
 			doc |= {"sealed_pricing": rules.SECOND_PRICE}
+		elif auction_type == rules.UNIFORM:
+			doc |= {"quantity": 5}
+		elif auction_type == rules.BEST_OFFER:
+			doc |= {"buy_now_price": 100}
+			doc.pop("start_price")
 		else:
 			doc |= {"start_price": 100, "floor_price": 40, "price_step": 5, "step_interval_seconds": 60}
 		doc |= values
@@ -216,7 +221,7 @@ class TestDutch(AuctionTestCase):
 		self.assertEqual((state["current_price"], state["units_left"]), (90, 3))
 
 		state = engine.accept_price(auction.name, "2", user("ann"), self.now)
-		self.assertEqual(state["units_left"], 1)
+		self.assertEqual((state["units_left"], state["you_bought"]), (1, 2))
 		order = self.order(state["sales_order"])
 		self.assertEqual((order.customer, order.items[0].rate, order.items[0].qty), (customer("ann"), 90, 2))
 
@@ -234,6 +239,150 @@ class TestDutch(AuctionTestCase):
 		auction = self.make(rules.DUTCH)
 		with self.assertRaises(BidRejected):
 			self.bid(auction, "ann", "90")
+
+
+class TestBuyNow(AuctionTestCase):
+	def test_english_buy_now_sells_at_once_until_the_first_bid(self) -> None:
+		auction = self.make(rules.ENGLISH, buy_now_price=80)
+		self.assertEqual(engine.public_state(auction, user("ann"), self.now)["buy_now_price"], 80)
+		state = engine.buy_now(auction.name, user("ann"), self.now)
+		auction = self.reload(auction)
+		self.assertEqual((auction.status, auction.winning_bidder), (engine.SOLD, user("ann")))
+		self.assertEqual(self.order(state["sales_order"]).items[0].rate, 80)
+		self.assertTrue(state["you_won"])
+
+	def test_english_buy_now_goes_away_after_a_bid(self) -> None:
+		auction = self.make(rules.ENGLISH, buy_now_price=80)
+		self.bid(auction, "bob", "15")
+		self.assertIsNone(engine.public_state(self.reload(auction), user("ann"), self.now)["buy_now_price"])
+		with self.assertRaisesRegex(BidRejected, "Buy It Now"):
+			engine.buy_now(auction.name, user("ann"), self.now)
+
+	def test_with_a_reserve_buy_now_lasts_until_the_reserve_is_met(self) -> None:
+		auction = self.make(rules.ENGLISH, buy_now_price=80, reserve_price=50)
+		self.bid(auction, "bob", "20")
+		engine.buy_now(auction.name, user("ann"), self.now)
+		self.assertEqual(self.reload(auction).winning_bidder, user("ann"))
+
+	def test_sealed_buy_now_beats_the_bids_in(self) -> None:
+		auction = self.make(rules.SEALED, buy_now_price=80)
+		self.bid(auction, "bob", "70")
+		engine.buy_now(auction.name, user("ann"), self.now)
+		auction = self.reload(auction)
+		self.assertEqual(
+			(auction.status, auction.winning_bidder, auction.current_price), (engine.SOLD, user("ann"), 80)
+		)
+
+	def test_a_buy_now_price_must_sit_above_the_start(self) -> None:
+		with self.assertRaises(frappe.ValidationError):
+			self.make(rules.ENGLISH, buy_now_price=5)
+
+
+class TestUniform(AuctionTestCase):
+	def test_winners_take_units_and_all_pay_the_lowest_winning_bid(self) -> None:
+		auction = self.make(rules.UNIFORM)
+		engine.place_bid(auction.name, "30", user("ann"), self.now, qty="2")
+		engine.place_bid(auction.name, "25", user("bob"), self.now + timedelta(seconds=1), qty="2")
+		engine.place_bid(auction.name, "20", user("cat"), self.now + timedelta(seconds=2), qty="3")
+		state = engine.public_state(self.reload(auction), user("bob"), self.now)
+		self.assertIsNone(state["current_price"])
+		self.assertEqual((state["your_bid"], state["your_qty"], state["bid_count"]), (25, 2, 3))
+
+		self.assertEqual(engine.close(auction.name, self.now + 2 * HOUR), engine.SOLD)
+		auction = self.reload(auction)
+		self.assertEqual((auction.current_price, auction.units_sold), (20, 5))
+		won = frappe.get_all(
+			"Auction Bid",
+			filters={"auction": auction.name, "is_winner": 1},
+			fields=["bidder", "units_won", "sales_order"],
+			order_by="amount desc",
+		)
+		self.assertEqual([(w.bidder, w.units_won) for w in won], [(user("ann"), 2), (user("bob"), 2), (user("cat"), 1)])
+		for winner in won:
+			order = self.order(winner.sales_order)
+			self.assertEqual((order.items[0].rate, order.items[0].qty), (20, winner.units_won))
+		self.assertEqual(engine.public_state(auction, user("cat"), self.now + 2 * HOUR)["you_won_units"], 1)
+
+	def test_a_bid_asks_for_whole_units_on_offer(self) -> None:
+		auction = self.make(rules.UNIFORM)
+		with self.assertRaisesRegex(BidRejected, "whole number"):
+			engine.place_bid(auction.name, "20", user("ann"), self.now, qty="1.5")
+		with self.assertRaisesRegex(BidRejected, "Only 5"):
+			engine.place_bid(auction.name, "20", user("ann"), self.now, qty="6")
+
+	def test_no_bid_over_the_reserve_leaves_it_unsold(self) -> None:
+		auction = self.make(rules.UNIFORM, reserve_price=50)
+		engine.place_bid(auction.name, "30", user("ann"), self.now, qty="2")
+		self.assertEqual(engine.close(auction.name, self.now + 2 * HOUR), engine.UNSOLD)
+
+
+class TestBestOffer(AuctionTestCase):
+	def offers(self, auction: Any) -> dict[str, str]:
+		rows = frappe.get_all(
+			"Auction Bid",
+			filters={"auction": auction.name, "bid_type": engine.OFFER},
+			fields=["bidder", "amount", "offer_status"],
+			order_by="placed_at asc, creation asc",
+		)
+		return {f"{row.bidder.split('.')[0]} {int(row.amount)}": row.offer_status for row in rows}
+
+	def test_offers_are_decided_by_thresholds_or_left_for_the_seller(self) -> None:
+		auction = self.make(rules.BEST_OFFER, auto_accept_offer=90, auto_decline_offer=50)
+		engine.make_offer(auction.name, "40", user("bob"), self.now)
+		state = engine.make_offer(auction.name, "70", user("cat"), self.now)
+		self.assertEqual((state["your_offer"], state["your_offer_status"]), (70, rules.OFFER_PENDING))
+		engine.make_offer(auction.name, "95", user("ann"), self.now)
+		self.assertEqual(
+			self.offers(auction),
+			{"bob 40": rules.OFFER_DECLINED, "cat 70": rules.OFFER_DECLINED, "ann 95": rules.OFFER_ACCEPTED},
+		)
+		auction = self.reload(auction)
+		self.assertEqual(
+			(auction.status, auction.winning_bidder, auction.current_price), (engine.SOLD, user("ann"), 95)
+		)
+		self.assertEqual(self.order(auction.sales_order).items[0].rate, 95)
+
+	def test_the_seller_accepts_or_declines_a_pending_offer(self) -> None:
+		auction = self.make(rules.BEST_OFFER)
+		engine.make_offer(auction.name, "60", user("bob"), self.now)
+		engine.make_offer(auction.name, "70", user("cat"), self.now)
+		bob, cat = (
+			frappe.get_all("Auction Bid", filters={"auction": auction.name, "bidder": user(b)}, pluck="name")[0]
+			for b in ("bob", "cat")
+		)
+		engine.decline_offer(bob)
+		with self.assertRaisesRegex(BidRejected, "pending"):
+			engine.accept_offer(bob, self.now)
+		sales_order = engine.accept_offer(cat, self.now)
+		self.assertEqual(self.order(sales_order).customer, customer("cat"))
+		self.assertEqual(self.reload(auction).winning_bidder, user("cat"))
+
+	def test_a_new_offer_replaces_the_buyers_pending_one(self) -> None:
+		auction = self.make(rules.BEST_OFFER)
+		engine.make_offer(auction.name, "60", user("bob"), self.now)
+		engine.make_offer(auction.name, "65", user("bob"), self.now + timedelta(seconds=1))
+		self.assertEqual(self.offers(auction), {"bob 60": rules.OFFER_REPLACED, "bob 65": rules.OFFER_PENDING})
+
+	def test_buying_at_the_asking_price_declines_the_pending_offers(self) -> None:
+		auction = self.make(rules.BEST_OFFER)
+		engine.make_offer(auction.name, "60", user("bob"), self.now)
+		with self.assertRaisesRegex(BidRejected, "buy it now"):
+			engine.make_offer(auction.name, "100", user("ann"), self.now)
+		engine.buy_now(auction.name, user("ann"), self.now)
+		self.assertEqual(self.offers(auction), {"bob 60": rules.OFFER_DECLINED})
+		self.assertEqual(self.reload(auction).current_price, 100)
+
+	def test_pending_offers_expire_at_the_close_and_bids_are_refused(self) -> None:
+		auction = self.make(rules.BEST_OFFER)
+		with self.assertRaisesRegex(BidRejected, "offers"):
+			self.bid(auction, "ann", "60")
+		engine.make_offer(auction.name, "60", user("bob"), self.now)
+		self.assertEqual(engine.close(auction.name, self.now + 2 * HOUR), engine.UNSOLD)
+		self.assertEqual(self.offers(auction), {"bob 60": rules.OFFER_EXPIRED})
+
+	def test_a_listing_needs_its_asking_price(self) -> None:
+		with self.assertRaises(frappe.ValidationError):
+			self.make(rules.BEST_OFFER, buy_now_price=0)
 
 
 class TestOpenAndClose(AuctionTestCase):

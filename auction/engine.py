@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Applies ``auction.rules`` to auctions in the database: bids, Dutch purchases, the scheduled open and close,
-and settlement (a submitted Sales Order for the winner, and a Payment Request when the auction names a
-gateway).
+"""Applies ``auction.rules`` to auctions in the database: bids, Dutch and Buy It Now purchases, Best Offer
+offers, the scheduled open and close, and settlement (a submitted Sales Order for each buyer, and a Payment
+Request when the auction names a gateway).
 
 Every write to an auction first locks its row (``SELECT … FOR UPDATE``), so two bids arriving together are
 judged one after the other, each against the bids before it. The lock is held until the request's
@@ -30,6 +30,14 @@ OPEN = "Open"
 SOLD = "Sold"
 UNSOLD = "Unsold"
 CLOSED_STATUSES = (SOLD, UNSOLD)
+
+# Auction Bid types.
+BID = "Bid"
+BUY_NOW = "Buy Now"
+OFFER = "Offer"
+PURCHASE = "Purchase"
+# The Auction Bid rows a format's page reads; the rest read bids.
+ROW_TYPE = {rules.DUTCH: PURCHASE, rules.BEST_OFFER: OFFER}
 DEFAULT_CURRENCY_PRECISION = 2
 
 
@@ -58,17 +66,21 @@ def _locked(name: str) -> Auction:
 	return frappe.get_doc("Auction", name)
 
 
-def _bid_rows(name: str) -> list[Any]:
+def _qty(value: Any) -> Decimal:
+	return Decimal(str(flt(value)))
+
+
+def _bid_rows(name: str, bid_type: str = BID) -> list[Any]:
 	return frappe.get_all(
 		"Auction Bid",
-		filters={"auction": name},
-		fields=["name", "bidder", "customer", "amount", "qty", "placed_at"],
+		filters={"auction": name, "bid_type": bid_type},
+		fields=["name", "bidder", "customer", "amount", "qty", "placed_at", "offer_status", "is_winner", "units_won"],
 		order_by="placed_at asc, creation asc",
 	)
 
 
 def _as_bid(row: Any) -> Bid:
-	return Bid(bidder=row.bidder, amount=money(row.amount), placed=get_datetime(row.placed_at))
+	return Bid(bidder=row.bidder, amount=money(row.amount), placed=get_datetime(row.placed_at), qty=_qty(row.qty))
 
 
 def _bids(name: str) -> list[Bid]:
@@ -141,39 +153,62 @@ def dutch_price(auction: Auction, at: datetime) -> Decimal:
 
 
 def units_left(auction: Auction) -> Decimal:
-	return Decimal(str(flt(auction.quantity))) - Decimal(str(flt(auction.units_sold)))
+	return _qty(auction.quantity) - _qty(auction.units_sold)
 
 
-def _insert_bid(auction: Auction, user: str, customer: str, amount: Decimal, qty: Decimal, now: datetime) -> Any:
+def _insert_bid(
+	auction: Auction,
+	user: str,
+	customer: str,
+	amount: Decimal,
+	qty: Decimal,
+	now: datetime,
+	bid_type: str = BID,
+	**values: Any,
+) -> Any:
 	return frappe.get_doc(
 		{
 			"doctype": "Auction Bid",
 			"auction": auction.name,
+			"bid_type": bid_type,
 			"bidder": user,
 			"customer": customer,
 			"amount": amount,
 			"qty": qty,
 			"placed_at": now,
+			**values,
 		}
 	).insert(ignore_permissions=True)
 
 
-def place_bid(name: str, amount: Any, user: str, now: datetime | None = None) -> dict[str, Any]:
-	"""An English bid (the bidder's maximum) or a Sealed bid."""
+def _units(value: Any) -> Decimal:
+	try:
+		return Decimal(str(value).strip())
+	except (InvalidOperation, AttributeError) as error:
+		raise BidRejected(_("Choose at least one unit.")) from error
+
+
+def place_bid(name: str, amount: Any, user: str, now: datetime | None = None, qty: Any = None) -> dict[str, Any]:
+	"""An English bid (the bidder's maximum), a Sealed bid, or a Uniform Price bid for `qty` units."""
 	now = now or now_datetime()
 	auction = _locked(name)
 	_require_open(auction, now)
 	if auction.auction_type == rules.DUTCH:
 		raise BidRejected(_("This is a Dutch auction: accept the price instead of bidding."))
+	if auction.auction_type == rules.BEST_OFFER:
+		raise BidRejected(_("This listing takes offers, not bids."))
 	customer = customer_for(user)
-	bid = Bid(bidder=user, amount=money(amount), placed=now)
+	units = _units(qty) if auction.auction_type == rules.UNIFORM else _qty(auction.quantity)
+	bid = Bid(bidder=user, amount=money(amount), placed=now, qty=units)
 	bids = _bids(auction.name)
 	if auction.auction_type == rules.ENGLISH:
 		terms = _terms(auction)
 		rules.check_english_bid(bids, bid, terms["start"], terms["increment"], terms["reserve"])
+	elif auction.auction_type == rules.UNIFORM:
+		rules.check_uniform_bid(bids, bid, money(auction.start_price), _qty(auction.quantity))
 	else:
 		rules.check_sealed_bid(bids, bid, money(auction.start_price))
-	_insert_bid(auction, user, customer, bid.amount, Decimal(str(flt(auction.quantity))), now)
+	_insert_bid(auction, user, customer, bid.amount, units, now)
 	bids.append(bid)
 	values: dict[str, Any] = {"bid_count": len(bids), "status": OPEN}
 	if auction.auction_type == rules.ENGLISH:
@@ -191,27 +226,121 @@ def accept_price(name: str, qty: Any, user: str, now: datetime | None = None) ->
 	_require_open(auction, now)
 	if auction.auction_type != rules.DUTCH:
 		raise BidRejected(_("Only a Dutch auction can be bought at the current price."))
-	try:
-		units = Decimal(str(qty))
-	except InvalidOperation as error:
-		raise BidRejected(_("Choose at least one unit.")) from error
+	units = _units(qty)
 	rules.check_dutch_accept(units_left(auction), units)
 	customer = customer_for(user)
 	price = dutch_price(auction, now)
-	purchase = _insert_bid(auction, user, customer, price, units, now)
+	purchase = _insert_bid(auction, user, customer, price, units, now, PURCHASE)
 	sales_order = settle(auction, customer, units, price)
-	purchase.db_set({"is_winner": 1, "sales_order": sales_order})
-	sold = Decimal(str(flt(auction.units_sold))) + units
+	purchase.db_set({"is_winner": 1, "units_won": units, "sales_order": sales_order})
+	sold = _qty(auction.units_sold) + units
 	values: dict[str, Any] = {
 		"units_sold": sold,
 		"current_price": price,
 		"bid_count": cint(auction.bid_count) + 1,
 		"status": OPEN,
 	}
-	if sold >= Decimal(str(flt(auction.quantity))):
+	if sold >= _qty(auction.quantity):
 		values.update(status=SOLD, closed_at=now)
 	_update(auction, **values)
 	return public_state(auction, user, now) | {"sales_order": sales_order}
+
+
+def buy_now(name: str, user: str, now: datetime | None = None) -> dict[str, Any]:
+	"""Ends an English, Sealed or Best Offer auction by buying the lot at its Buy It Now price."""
+	now = now or now_datetime()
+	auction = _locked(name)
+	_require_open(auction, now)
+	standing = (
+		english_standing(auction, _bids(auction.name)) if auction.auction_type == rules.ENGLISH else rules.NO_BIDS
+	)
+	price = _optional_money(auction.buy_now_price)
+	if price is None or not rules.buy_now_available(
+		auction.auction_type, price, standing, _optional_money(auction.reserve_price)
+	):
+		raise BidRejected(_("Buy It Now isn't available on this auction now."))
+	customer = customer_for(user)
+	purchase = _insert_bid(auction, user, customer, price, _qty(auction.quantity), now, BUY_NOW)
+	sales_order = _sell_lot(auction, purchase.name, user, customer, price, now)
+	return public_state(auction, user, now) | {"sales_order": sales_order}
+
+
+def _sell_lot(auction: Auction, bid_name: str, user: str, customer: str, price: Decimal, now: datetime) -> str:
+	"""Sells an English, Sealed or Best Offer lot to one buyer at `price`; any offers still pending are
+	declined."""
+	sales_order = settle(auction, customer, _qty(auction.quantity), price)
+	frappe.db.set_value("Auction Bid", bid_name, {"is_winner": 1, "sales_order": sales_order})
+	_set_pending_offers(auction, rules.OFFER_DECLINED)
+	_update(
+		auction,
+		status=SOLD,
+		closed_at=now,
+		current_price=price,
+		winning_bidder=user,
+		winning_customer=customer,
+		sales_order=sales_order,
+	)
+	return sales_order
+
+
+def _set_pending_offers(auction: Auction, status: str, bidder: str | None = None) -> None:
+	filters: dict[str, Any] = {"auction": auction.name, "bid_type": OFFER, "offer_status": rules.OFFER_PENDING}
+	if bidder:
+		filters["bidder"] = bidder
+	for pending in frappe.get_all("Auction Bid", filters=filters, pluck="name"):
+		frappe.db.set_value("Auction Bid", pending, "offer_status", status)
+
+
+def make_offer(name: str, amount: Any, user: str, now: datetime | None = None) -> dict[str, Any]:
+	"""An offer below a Best Offer listing's asking price. It replaces the buyer's own pending offer, and is
+	accepted or declined at once when it crosses the seller's thresholds."""
+	now = now or now_datetime()
+	auction = _locked(name)
+	_require_open(auction, now)
+	if auction.auction_type != rules.BEST_OFFER:
+		raise BidRejected(_("This auction doesn't take offers."))
+	customer = customer_for(user)
+	offer = money(amount)
+	decision = rules.offer_decision(
+		offer,
+		money(auction.buy_now_price),
+		_optional_money(auction.auto_accept_offer),
+		_optional_money(auction.auto_decline_offer),
+	)
+	_set_pending_offers(auction, rules.OFFER_REPLACED, bidder=user)
+	row = _insert_bid(auction, user, customer, offer, _qty(auction.quantity), now, OFFER, offer_status=decision)
+	_update(auction, bid_count=cint(auction.bid_count) + 1, status=OPEN)
+	if decision == rules.OFFER_ACCEPTED:
+		row.db_set("offer_status", rules.OFFER_ACCEPTED)
+		_sell_lot(auction, row.name, user, customer, offer, now)
+	return public_state(auction, user, now)
+
+
+def _pending_offer(bid_name: str) -> tuple[Auction, Any]:
+	auction_name = frappe.db.get_value("Auction Bid", bid_name, "auction")
+	if not auction_name:
+		raise frappe.DoesNotExistError(_("Offer {0} not found").format(bid_name))
+	auction = _locked(auction_name)
+	row = frappe.get_doc("Auction Bid", bid_name)
+	if row.bid_type != OFFER or row.offer_status != rules.OFFER_PENDING:
+		raise BidRejected(_("Only a pending offer can be answered."))
+	if auction.status in CLOSED_STATUSES:
+		raise BidRejected(_("This listing has closed."))
+	return auction, row
+
+
+def accept_offer(bid_name: str, now: datetime | None = None) -> str:
+	"""The seller accepts a pending offer: the lot is sold to that buyer at the offer. Returns the Sales
+	Order."""
+	now = now or now_datetime()
+	auction, row = _pending_offer(bid_name)
+	row.db_set("offer_status", rules.OFFER_ACCEPTED)
+	return _sell_lot(auction, row.name, row.bidder, row.customer, money(row.amount), now)
+
+
+def decline_offer(bid_name: str) -> None:
+	_auction, row = _pending_offer(bid_name)
+	row.db_set("offer_status", rules.OFFER_DECLINED)
 
 
 def close(name: str, now: datetime | None = None) -> str:
@@ -226,6 +355,12 @@ def close(name: str, now: datetime | None = None) -> str:
 		status = SOLD if flt(auction.units_sold) > 0 else UNSOLD
 		_update(auction, status=status, closed_at=now)
 		return status
+	if auction.auction_type == rules.BEST_OFFER:
+		_set_pending_offers(auction, rules.OFFER_EXPIRED)
+		_update(auction, status=UNSOLD, closed_at=now)
+		return UNSOLD
+	if auction.auction_type == rules.UNIFORM:
+		return _close_uniform(auction, now)
 	rows = _bid_rows(auction.name)
 	bids = [_as_bid(row) for row in rows]
 	if auction.auction_type == rules.ENGLISH:
@@ -240,16 +375,39 @@ def close(name: str, now: datetime | None = None) -> str:
 		_update(auction, **unsold)
 		return UNSOLD
 	winning = next(row for row in rows if row.bidder == standing.leader and money(row.amount) == standing.leader_amount)
-	sales_order = settle(auction, winning.customer, Decimal(str(flt(auction.quantity))), standing.price)
-	frappe.db.set_value("Auction Bid", winning.name, {"is_winner": 1, "sales_order": sales_order})
+	_sell_lot(auction, winning.name, winning.bidder, winning.customer, standing.price, now)
+	return SOLD
+
+
+def _close_uniform(auction: Auction, now: datetime) -> str:
+	rows = _bid_rows(auction.name)
+	price, won = rules.uniform_result(
+		[_as_bid(row) for row in rows],
+		_qty(auction.quantity),
+		money(auction.start_price),
+		_optional_money(auction.reserve_price),
+	)
+	if price is None:
+		_update(auction, status=UNSOLD, closed_at=now)
+		return UNSOLD
+	for allocation in won:
+		row = next(
+			r
+			for r in rows
+			if r.bidder == allocation.bid.bidder
+			and money(r.amount) == allocation.bid.amount
+			and get_datetime(r.placed_at) == allocation.bid.placed
+		)
+		sales_order = settle(auction, row.customer, allocation.units, price)
+		frappe.db.set_value(
+			"Auction Bid", row.name, {"is_winner": 1, "units_won": allocation.units, "sales_order": sales_order}
+		)
 	_update(
 		auction,
 		status=SOLD,
 		closed_at=now,
-		current_price=standing.price,
-		winning_bidder=standing.leader,
-		winning_customer=winning.customer,
-		sales_order=sales_order,
+		current_price=price,
+		units_sold=sum((a.units for a in won), Decimal(0)),
 	)
 	return SOLD
 
@@ -373,9 +531,11 @@ def public_state(auction: Auction, user: str, now: datetime | None = None) -> di
 		"seconds_to_end": max(0, int((ends - now).total_seconds())),
 		"signed_in": bool(user and user != "Guest"),
 	}
-	rows = _bid_rows(auction.name)
-	own = [row for row in rows if row.bidder == user] if state["signed_in"] else []
+	signed_in = state["signed_in"]
+	rows = _bid_rows(auction.name, ROW_TYPE.get(auction.auction_type, BID))
+	own = [row for row in rows if row.bidder == user] if signed_in else []
 	your_best = flt(max(row.amount for row in own)) if own else None
+	standing = rules.NO_BIDS
 	if auction.auction_type == rules.ENGLISH:
 		bids = [_as_bid(row) for row in rows]
 		standing = english_standing(auction, bids)
@@ -387,12 +547,27 @@ def public_state(auction: Auction, user: str, now: datetime | None = None) -> di
 			"your_max": your_best,
 			"reserve_met": standing.reserve_met if terms["reserve"] else None,
 		}
-	elif auction.auction_type == rules.SEALED:
+	elif auction.auction_type in rules.BLIND_FORMATS:
 		state |= {
 			"minimum_bid": flt(auction.start_price),
 			"your_bid": your_best,
-			"sealed_pricing": auction.sealed_pricing,
 			"current_price": flt(auction.current_price) if closed and auction.current_price else None,
+		}
+		if auction.auction_type == rules.SEALED:
+			state["sealed_pricing"] = auction.sealed_pricing
+		else:
+			best_own = max(own, key=lambda row: (flt(row.amount), get_datetime(row.placed_at))) if own else None
+			state |= {
+				"your_qty": flt(best_own.qty) if best_own else None,
+				"you_won_units": sum(flt(row.units_won) for row in own if row.is_winner),
+			}
+	elif auction.auction_type == rules.BEST_OFFER:
+		latest = own[-1] if own else None
+		state |= {
+			"asking_price": flt(auction.buy_now_price),
+			"current_price": flt(auction.current_price) if closed and auction.current_price else None,
+			"your_offer": flt(latest.amount) if latest else None,
+			"your_offer_status": latest.offer_status if latest else None,
 		}
 	else:
 		state |= {
@@ -404,8 +579,14 @@ def public_state(auction: Auction, user: str, now: datetime | None = None) -> di
 			"units_left": flt(units_left(auction)),
 			"you_bought": sum(flt(row.qty) for row in own),
 		}
-	if closed and auction.auction_type != rules.DUTCH:
-		state["you_won"] = state["signed_in"] and auction.winning_bidder == user
+	price = _optional_money(auction.buy_now_price)
+	if state["open"] and price and auction.auction_type != rules.BEST_OFFER:
+		available = rules.buy_now_available(
+			auction.auction_type, price, standing, _optional_money(auction.reserve_price)
+		)
+		state["buy_now_price"] = flt(price) if available else None
+	if closed and auction.auction_type in (rules.ENGLISH, rules.SEALED, rules.BEST_OFFER):
+		state["you_won"] = signed_in and auction.winning_bidder == user
 	return state
 
 

@@ -2,39 +2,163 @@
  "actions": [],
  "autoname": "hash",
  "creation": "2026-11-21 16:00:00.000000",
- "description": "A bid on an English or Sealed auction (the bidder's maximum), or a purchase at the clock price on a Dutch auction. Written only by the auction engine.",
+ "description": "A bid on an English, Sealed or Uniform Price auction, a Dutch or Buy It Now purchase, or an offer on a Best Offer listing. Written only by the auction engine.",
  "doctype": "DocType",
  "engine": "InnoDB",
  "field_order": [
-  "auction", "auction_type", "bidder", "customer", "column_break_main", "amount", "qty", "placed_at",
-  "result_section", "is_winner", "column_break_result", "sales_order"
+  "auction",
+  "auction_type",
+  "bid_type",
+  "bidder",
+  "customer",
+  "column_break_main",
+  "amount",
+  "qty",
+  "placed_at",
+  "result_section",
+  "is_winner",
+  "offer_status",
+  "units_won",
+  "column_break_result",
+  "sales_order"
  ],
  "fields": [
-  {"fieldname": "auction", "fieldtype": "Link", "in_list_view": 1, "in_standard_filter": 1, "label": "Auction", "options": "Auction", "read_only": 1, "reqd": 1, "search_index": 1},
-  {"fetch_from": "auction.auction_type", "fieldname": "auction_type", "fieldtype": "Data", "label": "Auction Type", "read_only": 1},
-  {"fieldname": "bidder", "fieldtype": "Link", "in_list_view": 1, "in_standard_filter": 1, "label": "Bidder", "options": "User", "read_only": 1, "reqd": 1, "search_index": 1},
-  {"fieldname": "customer", "fieldtype": "Link", "label": "Customer", "options": "Customer", "read_only": 1, "reqd": 1},
-  {"fieldname": "column_break_main", "fieldtype": "Column Break"},
-  {"description": "English: the bidder's maximum. Sealed: the bid. Dutch: the unit price paid.", "fieldname": "amount", "fieldtype": "Currency", "in_list_view": 1, "label": "Amount", "read_only": 1, "reqd": 1},
-  {"default": "1", "fieldname": "qty", "fieldtype": "Float", "label": "Quantity", "read_only": 1},
-  {"fieldname": "placed_at", "fieldtype": "Datetime", "in_list_view": 1, "label": "Placed At", "read_only": 1, "reqd": 1},
-  {"fieldname": "result_section", "fieldtype": "Section Break", "label": "Result"},
-  {"default": "0", "fieldname": "is_winner", "fieldtype": "Check", "in_standard_filter": 1, "label": "Won", "read_only": 1},
-  {"fieldname": "column_break_result", "fieldtype": "Column Break"},
-  {"fieldname": "sales_order", "fieldtype": "Link", "label": "Sales Order", "options": "Sales Order", "read_only": 1}
+  {
+   "fieldname": "auction",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Auction",
+   "options": "Auction",
+   "read_only": 1,
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fetch_from": "auction.auction_type",
+   "fieldname": "auction_type",
+   "fieldtype": "Data",
+   "label": "Auction Type",
+   "read_only": 1
+  },
+  {
+   "default": "Bid",
+   "fieldname": "bid_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Type",
+   "options": "Bid\nBuy Now\nOffer\nPurchase",
+   "read_only": 1
+  },
+  {
+   "fieldname": "bidder",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Bidder",
+   "options": "User",
+   "read_only": 1,
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "customer",
+   "fieldtype": "Link",
+   "label": "Customer",
+   "options": "Customer",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_main",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "English: the bidder's maximum. Sealed: the bid. Uniform Price: the bid a unit. Dutch, Buy It Now: the unit price paid. Offer: the amount offered.",
+   "fieldname": "amount",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Amount",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "default": "1",
+   "fieldname": "qty",
+   "fieldtype": "Float",
+   "label": "Quantity",
+   "read_only": 1,
+   "description": "Uniform Price: units bid for. Dutch: units bought. Otherwise the lot's quantity."
+  },
+  {
+   "fieldname": "placed_at",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Placed At",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "result_section",
+   "fieldtype": "Section Break",
+   "label": "Result"
+  },
+  {
+   "default": "0",
+   "fieldname": "is_winner",
+   "fieldtype": "Check",
+   "in_standard_filter": 1,
+   "label": "Won",
+   "read_only": 1
+  },
+  {
+   "depends_on": "eval:doc.bid_type=='Offer'",
+   "fieldname": "offer_status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Offer Status",
+   "options": "\nPending\nAccepted\nDeclined\nReplaced\nExpired",
+   "read_only": 1
+  },
+  {
+   "depends_on": "eval:doc.units_won",
+   "fieldname": "units_won",
+   "fieldtype": "Float",
+   "label": "Units Won",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_result",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "sales_order",
+   "fieldtype": "Link",
+   "label": "Sales Order",
+   "options": "Sales Order",
+   "read_only": 1
+  }
  ],
  "in_create": 1,
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-11-21 16:00:00.000000",
+ "modified": "2026-11-21 17:00:00.000000",
  "modified_by": "Administrator",
  "module": "Auction",
  "name": "Auction Bid",
  "naming_rule": "Random",
  "owner": "Administrator",
  "permissions": [
-  {"read": 1, "role": "System Manager"},
-  {"read": 1, "role": "Sales Manager"}
+  {
+   "read": 1,
+   "role": "System Manager"
+  },
+  {
+   "read": 1,
+   "role": "Sales Manager"
+  }
  ],
  "sort_field": "placed_at",
  "sort_order": "DESC",

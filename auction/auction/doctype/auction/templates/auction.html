@@ -17,6 +17,10 @@
 				· {{ _("bids stay hidden until the close") }}
 				{% elif doc.auction_type == "Dutch" %}
 				· {{ _("the price drops until someone buys") }}
+				{% elif doc.auction_type == "Uniform Price" %}
+				· {{ _("bids stay hidden; every winner pays the lowest winning bid") }}
+				{% elif doc.auction_type == "Best Offer" %}
+				· {{ _("buy at the asking price, or make an offer") }}
 				{% endif %}
 				{% if doc.quantity != 1 %} · {{ _("Quantity") }}: {{ doc.get_formatted("quantity") }}{% endif %}
 			</p>
@@ -29,9 +33,12 @@
 					<label class="form-label auction-input-label" for="auction-input"></label>
 					<div class="input-group">
 						<input id="auction-input" class="form-control auction-input" type="number" min="0" step="any" required>
+						<label class="sr-only visually-hidden" for="auction-units">{{ _("Units") }}</label>
+						<input id="auction-units" class="form-control auction-units" type="number" min="1" step="1" value="1" hidden>
 						<button class="btn btn-primary auction-submit" type="submit"></button>
 					</div>
 				</form>
+				<button class="auction-buy-now btn btn-outline-primary mt-2" type="button" hidden></button>
 				<a class="auction-sign-in btn btn-primary" href="/login?redirect-to=/{{ doc.route | e }}" hidden>{{ _("Sign in to take part") }}</a>
 				<div class="auction-own small mt-2"></div>
 			</div>
@@ -98,11 +105,15 @@
 			price = state.current_price === null ? money(state.minimum_bid) : money(state.current_price);
 			note = state.current_price === null ? t("Starting bid") : `${state.bid_count} ${t("bids")}`;
 			if (state.reserve_met === false) note += ` · ${t("reserve not met")}`;
-		} else if (type === "Sealed") {
+		} else if (type === "Sealed" || type === "Uniform Price") {
 			price = state.current_price ? money(state.current_price) : "";
 			note = state.current_price
 				? t("Winning price")
 				: `${t("Lowest bid")} ${money(state.minimum_bid)} · ${state.bid_count} ${t("bids")}`;
+			if (type === "Uniform Price" && !state.current_price) note += ` · ${state.quantity} ${t("units")}`;
+		} else if (type === "Best Offer") {
+			price = state.current_price ? money(state.current_price) : money(state.asking_price);
+			note = state.current_price ? t("Sold") : t("Asking price");
 		} else {
 			price = money(dutchPrice());
 			note = `${state.units_left} ${t("left")} · ${t("floor")} ${money(state.floor_price)}`;
@@ -113,6 +124,7 @@
 		const form = el("form");
 		form.hidden = !(live && state.signed_in);
 		el("sign-in").hidden = !(live && !state.signed_in);
+		el("units").hidden = type !== "Uniform Price";
 		if (type === "Dutch") {
 			el("input-label").textContent = t("Units");
 			el("submit").textContent = `${t("Buy now at")} ${money(dutchPrice())}`;
@@ -120,16 +132,33 @@
 			el("input").min = "1";
 			el("input").max = String(state.units_left);
 			if (!el("input").value) el("input").value = "1";
+		} else if (type === "Best Offer") {
+			el("input-label").textContent = t("Your offer");
+			el("submit").textContent = t("Make offer");
+			el("input").min = "0";
 		} else {
-			el("input-label").textContent = type === "English" ? t("Your maximum bid") : t("Your sealed bid");
+			el("input-label").textContent = {
+				English: t("Your maximum bid"),
+				Sealed: t("Your sealed bid"),
+				"Uniform Price": t("Your bid a unit, and units wanted"),
+			}[type];
 			el("submit").textContent = t("Place bid");
 			el("input").min = String(state.minimum_bid);
+			el("units").max = String(state.quantity);
 		}
+
+		const buyNowPrice = type === "Best Offer" ? state.asking_price : state.buy_now_price;
+		const buyNow = el("buy-now");
+		buyNow.hidden = !(live && state.signed_in && buyNowPrice);
+		buyNow.textContent = `${t("Buy It Now for")} ${money(buyNowPrice)}`;
 
 		const own = [];
 		if (state.you_lead) own.push(t("You are the highest bidder."));
 		if (state.your_max) own.push(`${t("Your maximum")}: ${money(state.your_max)}`);
 		if (state.your_bid) own.push(`${t("Your bid")}: ${money(state.your_bid)}`);
+		if (state.your_qty) own.push(`× ${state.your_qty}`);
+		if (state.you_won_units) own.push(`${t("You won")} ${state.you_won_units} ${t("units")}.`);
+		if (state.your_offer) own.push(`${t("Your offer")}: ${money(state.your_offer)} (${t(state.your_offer_status)})`);
 		if (state.you_bought) own.push(`${t("You bought")} ${state.you_bought}`);
 		if (state.you_won) own.push(t("You won. Your order and payment details are on their way."));
 		el("own").textContent = own.join(" ");
@@ -144,28 +173,37 @@
 				render();
 			});
 
-	el("form").addEventListener("submit", (event) => {
-		event.preventDefault();
-		const value = el("input").value;
-		const dutch = state.auction_type === "Dutch";
-		el("submit").disabled = true;
-		frappe
-			.call({
-				method: dutch ? "auction.api.accept_price" : "auction.api.place_bid",
-				args: dutch ? { auction: root.dataset.auction, qty: value } : { auction: root.dataset.auction, amount: value },
-				type: "POST",
-			})
+	const send = (method, args, button) => {
+		button.disabled = true;
+		return frappe
+			.call({ method, args: { auction: root.dataset.auction, ...args }, type: "POST" })
 			.then((r) => {
 				if (r.message) {
 					state = r.message;
 					loadedAt = Date.now();
-					el("input").value = dutch ? "1" : "";
+					el("input").value = state.auction_type === "Dutch" ? "1" : "";
 					render();
 				}
 			})
 			.always(() => {
-				el("submit").disabled = false;
+				button.disabled = false;
 			});
+	};
+
+	el("form").addEventListener("submit", (event) => {
+		event.preventDefault();
+		const value = el("input").value;
+		const type = state.auction_type;
+		if (type === "Dutch") send("auction.api.accept_price", { qty: value }, el("submit"));
+		else if (type === "Best Offer") send("auction.api.make_offer", { amount: value }, el("submit"));
+		else if (type === "Uniform Price")
+			send("auction.api.place_bid", { amount: value, qty: el("units").value }, el("submit"));
+		else send("auction.api.place_bid", { amount: value }, el("submit"));
+	});
+
+	el("buy-now").addEventListener("click", () => {
+		const price = state.auction_type === "Best Offer" ? state.asking_price : state.buy_now_price;
+		if (window.confirm(`${t("Buy this for")} ${money(price)}?`)) send("auction.api.buy_now", {}, el("buy-now"));
 	});
 
 	render();

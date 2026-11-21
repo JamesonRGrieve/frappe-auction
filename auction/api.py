@@ -1,15 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""The methods an auction's web page calls. Bidding and buying need a signed-in user; reading the state
-does not."""
+"""The methods an auction's web page calls, and the seller's answers to offers. Bidding, buying and offering
+need a signed-in user; reading the state does not. A refusal from the rules reaches the caller as its message,
+and the request's transaction rolls back."""
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import frappe
+from frappe import _
 
 from auction import engine
 from auction.rules import BidRejected
+
+SELLER_ROLES = ("Sales Manager", "System Manager")
 
 
 def _published(name: str) -> Any:
@@ -19,24 +25,56 @@ def _published(name: str) -> Any:
 	return auction
 
 
+@contextmanager
+def _refusals(title: str) -> Iterator[None]:
+	try:
+		yield
+	except BidRejected as rejected:
+		frappe.throw(str(rejected), title=title)
+
+
 @frappe.whitelist(allow_guest=True, methods=["GET"])
 def get_state(auction: str) -> dict[str, Any]:
 	return engine.public_state(_published(auction), frappe.session.user)
 
 
 @frappe.whitelist(methods=["POST"])
-def place_bid(auction: str, amount: str) -> dict[str, Any]:
+def place_bid(auction: str, amount: str, qty: str | None = None) -> dict[str, Any]:
 	_published(auction)
-	try:
-		return engine.place_bid(auction, amount, frappe.session.user)
-	except BidRejected as rejected:
-		frappe.throw(str(rejected), title=frappe._("Bid not accepted"))
+	with _refusals(_("Bid not accepted")):
+		return engine.place_bid(auction, amount, frappe.session.user, qty=qty)
 
 
 @frappe.whitelist(methods=["POST"])
 def accept_price(auction: str, qty: str = "1") -> dict[str, Any]:
 	_published(auction)
-	try:
+	with _refusals(_("Purchase not accepted")):
 		return engine.accept_price(auction, qty, frappe.session.user)
-	except BidRejected as rejected:
-		frappe.throw(str(rejected), title=frappe._("Purchase not accepted"))
+
+
+@frappe.whitelist(methods=["POST"])
+def buy_now(auction: str) -> dict[str, Any]:
+	_published(auction)
+	with _refusals(_("Purchase not accepted")):
+		return engine.buy_now(auction, frappe.session.user)
+
+
+@frappe.whitelist(methods=["POST"])
+def make_offer(auction: str, amount: str) -> dict[str, Any]:
+	_published(auction)
+	with _refusals(_("Offer not accepted")):
+		return engine.make_offer(auction, amount, frappe.session.user)
+
+
+@frappe.whitelist(methods=["POST"])
+def accept_offer(bid: str) -> str:
+	frappe.only_for(SELLER_ROLES)
+	with _refusals(_("Offer not accepted")):
+		return engine.accept_offer(bid)
+
+
+@frappe.whitelist(methods=["POST"])
+def decline_offer(bid: str) -> None:
+	frappe.only_for(SELLER_ROLES)
+	with _refusals(_("Offer not declined")):
+		engine.decline_offer(bid)

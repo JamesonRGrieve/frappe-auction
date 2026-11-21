@@ -17,6 +17,7 @@ TERMS_FIELDS = (
 	"sealed_pricing",
 	"start_price",
 	"reserve_price",
+	"buy_now_price",
 	"bid_increment",
 	"floor_price",
 	"price_step",
@@ -41,8 +42,17 @@ class Auction(WebsiteGenerator):
 			frappe.throw(_("Ends At must be after Starts At."))
 		if self.quantity <= 0:
 			frappe.throw(_("Quantity must be more than 0."))
-		if self.start_price <= 0:
+		if self.auction_type == rules.BEST_OFFER:
+			self.validate_best_offer()
+		elif (self.start_price or 0) <= 0:
 			frappe.throw(_("Start Price must be more than 0."))
+		if self.buy_now_price and self.auction_type not in (rules.ENGLISH, rules.SEALED, rules.BEST_OFFER):
+			self.buy_now_price = 0
+		if self.buy_now_price and self.auction_type != rules.BEST_OFFER:
+			if self.buy_now_price <= self.start_price or self.buy_now_price < (self.reserve_price or 0):
+				frappe.throw(_("Buy It Now Price must be above the Start Price and at least the Reserve Price."))
+		if self.auction_type == rules.UNIFORM and self.quantity != int(self.quantity):
+			frappe.throw(_("A Uniform Price auction offers a whole number of units."))
 		if self.auction_type == rules.ENGLISH and (self.bid_increment or 0) <= 0:
 			frappe.throw(_("Bid Increment must be more than 0."))
 		if self.auction_type == rules.SEALED and self.sealed_pricing not in rules.SEALED_PRICING:
@@ -54,7 +64,18 @@ class Auction(WebsiteGenerator):
 				frappe.throw(_("Price Drop per Step must be more than 0."))
 			if (self.step_interval_seconds or 0) <= 0:
 				frappe.throw(_("Step Interval must be more than 0 seconds."))
-			self.reserve_price = None
+			self.reserve_price = 0
+
+	def validate_best_offer(self) -> None:
+		if (self.buy_now_price or 0) <= 0:
+			frappe.throw(_("A Best Offer listing needs its asking price in Buy It Now Price."))
+		accept, decline = self.auto_accept_offer or 0, self.auto_decline_offer or 0
+		if accept and accept >= self.buy_now_price:
+			frappe.throw(_("Auto-Accept Offers From must be below the asking price."))
+		if accept and decline and decline > accept:
+			frappe.throw(_("Auto-Decline Offers Below can't be above Auto-Accept Offers From."))
+		self.start_price = 0
+		self.reserve_price = 0
 
 	def validate_locked_terms(self) -> None:
 		if self.is_new() or not self.bid_count:

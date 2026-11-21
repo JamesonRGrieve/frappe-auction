@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """The auction rules, as pure functions over bids: no database, no clock of their own.
 
-Three formats:
+Five formats:
 
 - **English**: open, ascending. A bid is the most the bidder will pay (a proxy maximum); the price shown is
   the least that keeps the leader ahead: the runner-up's maximum plus one increment, never above the leader's
@@ -10,9 +10,16 @@ Three formats:
   buyer to accept takes units at the price of that moment. Nothing is bid, so there is no bid book.
 - **Sealed**: blind. Each bidder's highest bid counts and nobody sees another's until the close. The highest
   wins and pays their own bid (first price) or the runner-up's (second price, a Vickrey auction).
+- **Uniform Price**: blind, several identical units. Each bid names a price and how many units; the highest
+  bids take units until they run out, and every winner pays the same price: the lowest winning bid.
+- **Best Offer**: a fixed asking price that anyone may pay at once, or offer less. An offer is accepted or
+  declined by the seller, or automatically by thresholds the seller set.
 
 A reserve is the least the seller will sell for. It is never shown. When an English leader's maximum reaches
 it, the price rises to it; otherwise the lot goes unsold.
+
+**Buy It Now** ends an English or Sealed auction at a fixed price. On English it lasts until the first bid, or,
+with a reserve, until the reserve is met. On Best Offer the asking price is the Buy It Now price.
 """
 
 from __future__ import annotations
@@ -25,11 +32,21 @@ from decimal import Decimal
 ENGLISH = "English"
 DUTCH = "Dutch"
 SEALED = "Sealed"
-FORMATS = (ENGLISH, DUTCH, SEALED)
+UNIFORM = "Uniform Price"
+BEST_OFFER = "Best Offer"
+FORMATS = (ENGLISH, DUTCH, SEALED, UNIFORM, BEST_OFFER)
+# Formats whose bids stay hidden until the close.
+BLIND_FORMATS = (SEALED, UNIFORM)
 
 FIRST_PRICE = "First Price"
 SECOND_PRICE = "Second Price"
 SEALED_PRICING = (FIRST_PRICE, SECOND_PRICE)
+
+OFFER_PENDING = "Pending"
+OFFER_ACCEPTED = "Accepted"
+OFFER_DECLINED = "Declined"
+OFFER_REPLACED = "Replaced"
+OFFER_EXPIRED = "Expired"
 
 
 class BidRejected(ValueError):
@@ -41,6 +58,7 @@ class Bid:
 	bidder: str
 	amount: Decimal
 	placed: datetime
+	qty: Decimal = Decimal(1)
 
 
 @dataclass(frozen=True)
@@ -159,3 +177,69 @@ def sealed_standing(bids: Iterable[Bid], start: Decimal, reserve: Decimal | None
 		raise ValueError(f"Unknown sealed pricing {pricing!r}")
 	reserve_met = not reserve or top.amount >= reserve
 	return Standing(leader=top.bidder, price=price, leader_amount=top.amount, reserve_met=reserve_met)
+
+
+@dataclass(frozen=True)
+class Allocation:
+	"""Units a Uniform Price bid wins."""
+
+	bid: Bid
+	units: Decimal
+
+
+def check_uniform_bid(bids: Iterable[Bid], bid: Bid, start: Decimal, units: Decimal) -> None:
+	if bid.amount < start:
+		raise BidRejected(f"The lowest bid is {start} a unit.")
+	if bid.qty <= 0 or bid.qty != bid.qty.to_integral_value():
+		raise BidRejected("Ask for a whole number of units.")
+	if bid.qty > units:
+		raise BidRejected(f"Only {units_text(units)} are on offer.")
+	own = [b.amount for b in bids if b.bidder == bid.bidder]
+	if own and bid.amount <= max(own):
+		raise BidRejected(f"Your bid of {max(own)} a unit stands; a new bid must be higher.")
+
+
+def uniform_result(
+	bids: Iterable[Bid], units: Decimal, start: Decimal, reserve: Decimal | None
+) -> tuple[Decimal | None, list[Allocation]]:
+	"""Each bidder's highest bid counts, for the units it asked for. Highest bids are filled first (equal bids
+	in the order placed) until the units run out; the last one filled may get fewer than it asked for. Every
+	winner pays the lowest winning bid. Bids under the start price or reserve win nothing."""
+	floor = max(start, reserve or Decimal(0))
+	left = units
+	won: list[Allocation] = []
+	for bid in best_per_bidder(bids):
+		if left <= 0:
+			break
+		if bid.amount < floor:
+			continue
+		take = min(bid.qty, left)
+		won.append(Allocation(bid=bid, units=take))
+		left -= take
+	if not won:
+		return None, []
+	return won[-1].bid.amount, won
+
+
+def buy_now_available(
+	auction_type: str, buy_now_price: Decimal | None, standing: Standing, reserve: Decimal | None
+) -> bool:
+	if not buy_now_price:
+		return False
+	if auction_type == ENGLISH:
+		return standing.leader is None or (bool(reserve) and not standing.reserve_met)
+	return auction_type in (SEALED, BEST_OFFER)
+
+
+def offer_decision(amount: Decimal, asking: Decimal, auto_accept: Decimal | None, auto_decline: Decimal | None) -> str:
+	"""What becomes of an offer as soon as it is made: accepted or declined by the seller's thresholds, or
+	left pending for the seller."""
+	if amount <= 0:
+		raise BidRejected("Offer an amount above 0.")
+	if amount >= asking:
+		raise BidRejected(f"Your offer reaches the price of {asking}: buy it now instead.")
+	if auto_accept and amount >= auto_accept:
+		return OFFER_ACCEPTED
+	if auto_decline and amount < auto_decline:
+		return OFFER_DECLINED
+	return OFFER_PENDING

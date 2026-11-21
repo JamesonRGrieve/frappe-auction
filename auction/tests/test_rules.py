@@ -169,5 +169,98 @@ class SealedTest(unittest.TestCase):
 			self.standing([bid("ann", "50", 1)], "Third Price")
 
 
+def unit_bid(bidder: str, amount: str, qty: int, seconds: int) -> Bid:
+	return Bid(bidder=bidder, amount=Decimal(amount), placed=at(seconds), qty=Decimal(qty))
+
+
+class UniformTest(unittest.TestCase):
+	UNITS = Decimal(5)
+
+	def result(self, bids: list[Bid], reserve: str | None = None) -> tuple[Decimal | None, list[tuple[str, int]]]:
+		price, won = rules.uniform_result(bids, self.UNITS, START, Decimal(reserve) if reserve else None)
+		return price, [(a.bid.bidder, int(a.units)) for a in won]
+
+	def test_highest_bids_fill_first_and_all_pay_the_lowest_winning_bid(self) -> None:
+		bids = [unit_bid("ann", "30", 2, 1), unit_bid("bob", "25", 2, 2), unit_bid("cat", "20", 3, 3)]
+		self.assertEqual(self.result(bids), (Decimal("20"), [("ann", 2), ("bob", 2), ("cat", 1)]))
+
+	def test_bids_below_the_cut_win_nothing(self) -> None:
+		bids = [unit_bid("ann", "30", 5, 1), unit_bid("bob", "25", 2, 2)]
+		self.assertEqual(self.result(bids), (Decimal("30"), [("ann", 5)]))
+
+	def test_equal_bids_fill_in_the_order_placed(self) -> None:
+		bids = [unit_bid("bob", "20", 4, 5), unit_bid("ann", "20", 4, 1)]
+		self.assertEqual(self.result(bids), (Decimal("20"), [("ann", 4), ("bob", 1)]))
+
+	def test_bids_under_the_reserve_are_left_out(self) -> None:
+		bids = [unit_bid("ann", "30", 2, 1), unit_bid("bob", "15", 2, 2)]
+		self.assertEqual(self.result(bids, reserve="20"), (Decimal("30"), [("ann", 2)]))
+		self.assertEqual(self.result([unit_bid("bob", "15", 2, 2)], reserve="20"), (None, []))
+
+	def test_a_bidders_highest_bid_counts_with_its_units(self) -> None:
+		bids = [unit_bid("ann", "12", 5, 1), unit_bid("ann", "18", 1, 2), unit_bid("bob", "15", 5, 3)]
+		self.assertEqual(self.result(bids), (Decimal("15"), [("ann", 1), ("bob", 4)]))
+
+	def test_a_bid_must_be_whole_units_on_offer_and_beat_the_bidders_own(self) -> None:
+		with self.assertRaisesRegex(BidRejected, "whole number"):
+			rules.check_uniform_bid([], Bid("ann", Decimal(20), at(1), Decimal("1.5")), START, self.UNITS)
+		with self.assertRaisesRegex(BidRejected, "Only 5"):
+			rules.check_uniform_bid([], unit_bid("ann", "20", 6, 1), START, self.UNITS)
+		with self.assertRaises(BidRejected):
+			rules.check_uniform_bid([], unit_bid("ann", "9", 1, 1), START, self.UNITS)
+		with self.assertRaisesRegex(BidRejected, "must be higher"):
+			rules.check_uniform_bid([unit_bid("ann", "20", 1, 1)], unit_bid("ann", "20", 3, 2), START, self.UNITS)
+		rules.check_uniform_bid([unit_bid("ann", "20", 1, 1)], unit_bid("ann", "21", 3, 2), START, self.UNITS)
+
+
+class BuyNowTest(unittest.TestCase):
+	PRICE = Decimal("80")
+
+	def available(self, auction_type: str, bids: list[Bid], reserve: str | None = None) -> bool:
+		reserve_amount = Decimal(reserve) if reserve else None
+		standing = rules.english_standing(bids, START, INCREMENT, reserve_amount)
+		return rules.buy_now_available(auction_type, self.PRICE, standing, reserve_amount)
+
+	def test_english_buy_now_lasts_until_the_first_bid(self) -> None:
+		self.assertTrue(self.available(rules.ENGLISH, []))
+		self.assertFalse(self.available(rules.ENGLISH, [bid("ann", "15", 1)]))
+
+	def test_with_a_reserve_english_buy_now_lasts_until_the_reserve_is_met(self) -> None:
+		self.assertTrue(self.available(rules.ENGLISH, [bid("ann", "15", 1)], reserve="50"))
+		self.assertFalse(self.available(rules.ENGLISH, [bid("ann", "60", 1)], reserve="50"))
+
+	def test_sealed_and_best_offer_keep_buy_now_and_others_never_have_it(self) -> None:
+		self.assertTrue(self.available(rules.SEALED, [bid("ann", "15", 1)]))
+		self.assertTrue(self.available(rules.BEST_OFFER, []))
+		self.assertFalse(self.available(rules.DUTCH, []))
+		self.assertFalse(self.available(rules.UNIFORM, []))
+
+	def test_no_price_means_no_buy_now(self) -> None:
+		self.assertFalse(rules.buy_now_available(rules.ENGLISH, None, rules.NO_BIDS, None))
+
+
+class OfferTest(unittest.TestCase):
+	ASKING = Decimal("100")
+
+	def decide(self, amount: str, accept: str | None = None, decline: str | None = None) -> str:
+		return rules.offer_decision(
+			Decimal(amount), self.ASKING, Decimal(accept) if accept else None, Decimal(decline) if decline else None
+		)
+
+	def test_an_offer_waits_for_the_seller_by_default(self) -> None:
+		self.assertEqual(self.decide("70"), rules.OFFER_PENDING)
+
+	def test_thresholds_accept_or_decline_at_once(self) -> None:
+		self.assertEqual(self.decide("90", accept="90", decline="60"), rules.OFFER_ACCEPTED)
+		self.assertEqual(self.decide("59.99", accept="90", decline="60"), rules.OFFER_DECLINED)
+		self.assertEqual(self.decide("60", accept="90", decline="60"), rules.OFFER_PENDING)
+
+	def test_an_offer_at_the_asking_price_is_sent_to_buy_now(self) -> None:
+		with self.assertRaisesRegex(BidRejected, "buy it now"):
+			self.decide("100")
+		with self.assertRaises(BidRejected):
+			self.decide("0")
+
+
 if __name__ == "__main__":
 	unittest.main()
