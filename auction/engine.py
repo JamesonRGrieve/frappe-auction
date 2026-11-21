@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Applies ``auction.rules`` to auctions in the database: bids, Dutch and Buy It Now purchases, Best Offer
-offers, the scheduled open and close, and settlement (a submitted Sales Order for each buyer, and a Payment
-Request when the auction names a gateway).
+offers, card holds, the scheduled open and close, and settlement (``auction.settlement``).
 
 Every write to an auction first locks its row (``SELECT … FOR UPDATE``), so two bids arriving together are
 judged one after the other, each against the bids before it. The lock is held until the request's
 transaction commits.
+
+Each bid, purchase or offer is an Auction Bid row. On an auction that settles "After Close" a row takes
+effect as soon as it is made. On one that holds payment ("Authorize at Bid") it waits, uncounted, until the
+buyer's gateway reports the hold (``hold_authorized``), and is judged again then: the auction may have moved
+while the buyer authorized.
 """
 
 from __future__ import annotations
@@ -17,9 +21,9 @@ from typing import TYPE_CHECKING, Any
 
 import frappe
 from frappe import _
-from frappe.utils import cint, flt, get_datetime, now_datetime, nowdate
+from frappe.utils import cint, flt, get_datetime, now_datetime
 
-from auction import rules
+from auction import holds, rules, settlement
 from auction.rules import Bid, BidRejected
 
 if TYPE_CHECKING:
@@ -30,6 +34,7 @@ OPEN = "Open"
 SOLD = "Sold"
 UNSOLD = "Unsold"
 CLOSED_STATUSES = (SOLD, UNSOLD)
+DEFAULT_CURRENCY_PRECISION = 2
 
 # Auction Bid types.
 BID = "Bid"
@@ -38,7 +43,20 @@ OFFER = "Offer"
 PURCHASE = "Purchase"
 # The Auction Bid rows a format's page reads; the rest read bids.
 ROW_TYPE = {rules.DUTCH: PURCHASE, rules.BEST_OFFER: OFFER}
-DEFAULT_CURRENCY_PRECISION = 2
+
+# Payment timing.
+AFTER_CLOSE = "After Close"
+AUTHORIZE_AT_BID = "Authorize at Bid"
+PAYMENT_TIMINGS = (AFTER_CLOSE, AUTHORIZE_AT_BID)
+
+# Auction Bid hold statuses. A row awaiting authorization, or whose hold failed, doesn't count.
+NOT_REQUIRED = "Not Required"
+AWAITING = "Awaiting Authorization"
+AUTHORIZED = "Authorized"
+RELEASED = "Released"
+CAPTURED = "Captured"
+FAILED = "Failed"
+UNCOUNTED_HOLDS = (AWAITING, FAILED)
 
 
 def _precision() -> int:
@@ -60,21 +78,46 @@ def _optional_money(value: Any) -> Decimal | None:
 	return money(value) if value else None
 
 
+def _qty(value: Any) -> Decimal:
+	return Decimal(str(flt(value)))
+
+
+def _units(value: Any) -> Decimal:
+	try:
+		return Decimal(str(value).strip())
+	except (InvalidOperation, AttributeError) as error:
+		raise BidRejected(_("Choose at least one unit.")) from error
+
+
 def _locked(name: str) -> Auction:
 	if not frappe.db.sql("select name from `tabAuction` where name = %s for update", name):
 		raise frappe.DoesNotExistError(_("Auction {0} not found").format(name))
 	return frappe.get_doc("Auction", name)
 
 
-def _qty(value: Any) -> Decimal:
-	return Decimal(str(flt(value)))
+ROW_FIELDS = [
+	"name",
+	"bid_type",
+	"bidder",
+	"customer",
+	"amount",
+	"qty",
+	"placed_at",
+	"offer_status",
+	"is_winner",
+	"units_won",
+	"hold_status",
+	"hold_reference",
+	"hold_amount",
+]
 
 
 def _bid_rows(name: str, bid_type: str = BID) -> list[Any]:
+	"""The rows of one type that count: every one but those awaiting or failing a hold."""
 	return frappe.get_all(
 		"Auction Bid",
-		filters={"auction": name, "bid_type": bid_type},
-		fields=["name", "bidder", "customer", "amount", "qty", "placed_at", "offer_status", "is_winner", "units_won"],
+		filters={"auction": name, "bid_type": bid_type, "hold_status": ["not in", UNCOUNTED_HOLDS]},
+		fields=ROW_FIELDS,
 		order_by="placed_at asc, creation asc",
 	)
 
@@ -105,6 +148,10 @@ def _require_open(auction: Auction, now: datetime) -> None:
 		raise BidRejected(_("This auction isn't open."))
 
 
+def holds_payment(auction: Auction) -> bool:
+	return auction.payment_timing == AUTHORIZE_AT_BID
+
+
 def customer_for(user: str) -> str:
 	"""The Customer a signed-in buyer buys as: the one their account is a portal user of, or, with the webshop
 	installed, the one the webshop finds or makes for them (as its checkout does)."""
@@ -124,7 +171,7 @@ def customer_for(user: str) -> str:
 
 def _terms(auction: Auction) -> dict[str, Any]:
 	return {
-		"start": money(auction.start_price),
+		"start": money(auction.start_price or 0),
 		"increment": money(auction.bid_increment or 0),
 		"reserve": _optional_money(auction.reserve_price),
 	}
@@ -156,36 +203,81 @@ def units_left(auction: Auction) -> Decimal:
 	return _qty(auction.quantity) - _qty(auction.units_sold)
 
 
-def _insert_bid(
-	auction: Auction,
-	user: str,
-	customer: str,
-	amount: Decimal,
-	qty: Decimal,
-	now: datetime,
-	bid_type: str = BID,
-	**values: Any,
-) -> Any:
-	return frappe.get_doc(
+# Checks. Each runs when a row is made, and again when its hold is authorized.
+
+
+def _check(auction: Auction, row: Any) -> None:
+	"""Refuses a row the auction can't take now, judged against the rows that count."""
+	if row.bid_type == BID:
+		bids = _bids(auction.name)
+		bid = _as_bid(row)
+		if auction.auction_type == rules.ENGLISH:
+			terms = _terms(auction)
+			rules.check_english_bid(bids, bid, terms["start"], terms["increment"], terms["reserve"])
+		elif auction.auction_type == rules.UNIFORM:
+			rules.check_uniform_bid(bids, bid, money(auction.start_price), _qty(auction.quantity))
+		else:
+			rules.check_sealed_bid(bids, bid, money(auction.start_price))
+	elif row.bid_type == PURCHASE:
+		rules.check_dutch_accept(units_left(auction), _qty(row.qty))
+	elif row.bid_type == BUY_NOW:
+		standing = (
+			english_standing(auction, _bids(auction.name)) if auction.auction_type == rules.ENGLISH else rules.NO_BIDS
+		)
+		price = _optional_money(auction.buy_now_price)
+		if price is None or not rules.buy_now_available(
+			auction.auction_type, price, standing, _optional_money(auction.reserve_price)
+		):
+			raise BidRejected(_("Buy It Now isn't available on this auction now."))
+	elif row.bid_type == OFFER:
+		_offer_decision(auction, money(row.amount))
+	else:
+		raise ValueError(f"Unknown Auction Bid type {row.bid_type!r}")
+
+
+def _offer_decision(auction: Auction, amount: Decimal) -> str:
+	return rules.offer_decision(
+		amount,
+		money(auction.buy_now_price),
+		_optional_money(auction.auto_accept_offer),
+		_optional_money(auction.auto_decline_offer),
+	)
+
+
+# Making rows.
+
+
+def _make_row(auction: Auction, user: str, amount: Decimal, qty: Decimal, now: datetime, bid_type: str) -> frappe._dict:
+	"""A row as it will be stored, checked before anything is written."""
+	row = frappe._dict(
+		bid_type=bid_type,
+		bidder=user,
+		customer=customer_for(user),
+		amount=amount,
+		qty=qty,
+		placed_at=now,
+	)
+	_check(auction, row)
+	return row
+
+
+def _submit_row(auction: Auction, row: frappe._dict, now: datetime) -> dict[str, Any]:
+	"""Stores a checked row. After Close: it takes effect now. Authorize at Bid: it waits for its hold, and the
+	result carries the page where the buyer authorizes it."""
+	held = holds_payment(auction)
+	doc = frappe.get_doc(
 		{
 			"doctype": "Auction Bid",
 			"auction": auction.name,
-			"bid_type": bid_type,
-			"bidder": user,
-			"customer": customer,
-			"amount": amount,
-			"qty": qty,
-			"placed_at": now,
-			**values,
+			**row,
+			"hold_status": AWAITING if held else NOT_REQUIRED,
+			"hold_amount": row.amount * row.qty if held else 0,
 		}
 	).insert(ignore_permissions=True)
-
-
-def _units(value: Any) -> Decimal:
-	try:
-		return Decimal(str(value).strip())
-	except (InvalidOperation, AttributeError) as error:
-		raise BidRejected(_("Choose at least one unit.")) from error
+	if held:
+		return public_state(auction, row.bidder, now) | {"authorize_url": holds.request(auction, doc)}
+	result = _apply(auction, doc, now)
+	return public_state(auction, row.bidder, now) | result
 
 
 def place_bid(name: str, amount: Any, user: str, now: datetime | None = None, qty: Any = None) -> dict[str, Any]:
@@ -197,53 +289,19 @@ def place_bid(name: str, amount: Any, user: str, now: datetime | None = None, qt
 		raise BidRejected(_("This is a Dutch auction: accept the price instead of bidding."))
 	if auction.auction_type == rules.BEST_OFFER:
 		raise BidRejected(_("This listing takes offers, not bids."))
-	customer = customer_for(user)
 	units = _units(qty) if auction.auction_type == rules.UNIFORM else _qty(auction.quantity)
-	bid = Bid(bidder=user, amount=money(amount), placed=now, qty=units)
-	bids = _bids(auction.name)
-	if auction.auction_type == rules.ENGLISH:
-		terms = _terms(auction)
-		rules.check_english_bid(bids, bid, terms["start"], terms["increment"], terms["reserve"])
-	elif auction.auction_type == rules.UNIFORM:
-		rules.check_uniform_bid(bids, bid, money(auction.start_price), _qty(auction.quantity))
-	else:
-		rules.check_sealed_bid(bids, bid, money(auction.start_price))
-	_insert_bid(auction, user, customer, bid.amount, units, now)
-	bids.append(bid)
-	values: dict[str, Any] = {"bid_count": len(bids), "status": OPEN}
-	if auction.auction_type == rules.ENGLISH:
-		values["current_price"] = english_standing(auction, bids).price
-		window = timedelta(minutes=cint(auction.extend_window_minutes))
-		values["ends_at"] = rules.extended_end(get_datetime(auction.ends_at), now, window)
-	_update(auction, **values)
-	return public_state(auction, user, now)
+	return _submit_row(auction, _make_row(auction, user, money(amount), units, now, BID), now)
 
 
 def accept_price(name: str, qty: Any, user: str, now: datetime | None = None) -> dict[str, Any]:
-	"""A Dutch purchase: `qty` units at the clock price of this moment, ordered at once."""
+	"""A Dutch purchase: `qty` units at the clock price of this moment."""
 	now = now or now_datetime()
 	auction = _locked(name)
 	_require_open(auction, now)
 	if auction.auction_type != rules.DUTCH:
 		raise BidRejected(_("Only a Dutch auction can be bought at the current price."))
-	units = _units(qty)
-	rules.check_dutch_accept(units_left(auction), units)
-	customer = customer_for(user)
-	price = dutch_price(auction, now)
-	purchase = _insert_bid(auction, user, customer, price, units, now, PURCHASE)
-	sales_order = settle(auction, customer, units, price)
-	purchase.db_set({"is_winner": 1, "units_won": units, "sales_order": sales_order})
-	sold = _qty(auction.units_sold) + units
-	values: dict[str, Any] = {
-		"units_sold": sold,
-		"current_price": price,
-		"bid_count": cint(auction.bid_count) + 1,
-		"status": OPEN,
-	}
-	if sold >= _qty(auction.quantity):
-		values.update(status=SOLD, closed_at=now)
-	_update(auction, **values)
-	return public_state(auction, user, now) | {"sales_order": sales_order}
+	row = _make_row(auction, user, dutch_price(auction, now), _units(qty), now, PURCHASE)
+	return _submit_row(auction, row, now)
 
 
 def buy_now(name: str, user: str, now: datetime | None = None) -> dict[str, Any]:
@@ -251,44 +309,8 @@ def buy_now(name: str, user: str, now: datetime | None = None) -> dict[str, Any]
 	now = now or now_datetime()
 	auction = _locked(name)
 	_require_open(auction, now)
-	standing = (
-		english_standing(auction, _bids(auction.name)) if auction.auction_type == rules.ENGLISH else rules.NO_BIDS
-	)
-	price = _optional_money(auction.buy_now_price)
-	if price is None or not rules.buy_now_available(
-		auction.auction_type, price, standing, _optional_money(auction.reserve_price)
-	):
-		raise BidRejected(_("Buy It Now isn't available on this auction now."))
-	customer = customer_for(user)
-	purchase = _insert_bid(auction, user, customer, price, _qty(auction.quantity), now, BUY_NOW)
-	sales_order = _sell_lot(auction, purchase.name, user, customer, price, now)
-	return public_state(auction, user, now) | {"sales_order": sales_order}
-
-
-def _sell_lot(auction: Auction, bid_name: str, user: str, customer: str, price: Decimal, now: datetime) -> str:
-	"""Sells an English, Sealed or Best Offer lot to one buyer at `price`; any offers still pending are
-	declined."""
-	sales_order = settle(auction, customer, _qty(auction.quantity), price)
-	frappe.db.set_value("Auction Bid", bid_name, {"is_winner": 1, "sales_order": sales_order})
-	_set_pending_offers(auction, rules.OFFER_DECLINED)
-	_update(
-		auction,
-		status=SOLD,
-		closed_at=now,
-		current_price=price,
-		winning_bidder=user,
-		winning_customer=customer,
-		sales_order=sales_order,
-	)
-	return sales_order
-
-
-def _set_pending_offers(auction: Auction, status: str, bidder: str | None = None) -> None:
-	filters: dict[str, Any] = {"auction": auction.name, "bid_type": OFFER, "offer_status": rules.OFFER_PENDING}
-	if bidder:
-		filters["bidder"] = bidder
-	for pending in frappe.get_all("Auction Bid", filters=filters, pluck="name"):
-		frappe.db.set_value("Auction Bid", pending, "offer_status", status)
+	price = _optional_money(auction.buy_now_price) or Decimal(0)
+	return _submit_row(auction, _make_row(auction, user, price, _qty(auction.quantity), now, BUY_NOW), now)
 
 
 def make_offer(name: str, amount: Any, user: str, now: datetime | None = None) -> dict[str, Any]:
@@ -299,21 +321,163 @@ def make_offer(name: str, amount: Any, user: str, now: datetime | None = None) -
 	_require_open(auction, now)
 	if auction.auction_type != rules.BEST_OFFER:
 		raise BidRejected(_("This auction doesn't take offers."))
-	customer = customer_for(user)
-	offer = money(amount)
-	decision = rules.offer_decision(
-		offer,
-		money(auction.buy_now_price),
-		_optional_money(auction.auto_accept_offer),
-		_optional_money(auction.auto_decline_offer),
-	)
-	_set_pending_offers(auction, rules.OFFER_REPLACED, bidder=user)
-	row = _insert_bid(auction, user, customer, offer, _qty(auction.quantity), now, OFFER, offer_status=decision)
+	return _submit_row(auction, _make_row(auction, user, money(amount), _qty(auction.quantity), now, OFFER), now)
+
+
+# Holds.
+
+
+def hold_authorized(bid_name: str, hold_reference: str, now: datetime | None = None) -> None:
+	"""Called by the gateway once it holds a row's amount. The row is judged again against the auction as it
+	is now: refused, its hold is released and the row fails; accepted, it takes effect."""
+	now = now or now_datetime()
+	auction, row = _awaiting(bid_name)
+	if row is None:
+		return
+	# Judged while still uncounted, so the row isn't measured against itself.
+	try:
+		_require_open(auction, now)
+		_check(auction, row)
+	except BidRejected as refused:
+		row.db_set({"hold_status": AUTHORIZED, "hold_reference": hold_reference})
+		_release(auction, row)
+		row.db_set({"hold_status": FAILED, "hold_error": str(refused)})
+		return
+	row.db_set({"hold_status": AUTHORIZED, "hold_reference": hold_reference})
+	_apply(auction, row, now)
+
+
+def hold_failed(bid_name: str, reason: str) -> None:
+	"""Called by the gateway when the buyer's card won't hold the amount."""
+	_auction, row = _awaiting(bid_name)
+	if row is not None:
+		row.db_set({"hold_status": FAILED, "hold_error": reason})
+
+
+def _awaiting(bid_name: str) -> tuple[Auction, Any | None]:
+	auction_name = frappe.db.get_value("Auction Bid", bid_name, "auction")
+	if not auction_name:
+		raise frappe.DoesNotExistError(_("Auction Bid {0} not found").format(bid_name))
+	auction = _locked(auction_name)
+	row = frappe.get_doc("Auction Bid", bid_name)
+	# A gateway may report twice; only the first report of a waiting row counts.
+	return auction, row if row.hold_status == AWAITING else None
+
+
+def _release(auction: Auction, row: Any) -> None:
+	"""Lets a row's hold go. A gateway that fails to release leaves the hold Authorized and an Error Log entry,
+	and doesn't undo the sale or close that released it."""
+	if row.hold_status != AUTHORIZED:
+		return
+	try:
+		holds.release(auction, row.hold_reference)
+	except Exception:
+		frappe.log_error(
+			title=f"Auction Bid {row.name}: releasing the hold failed",
+			reference_doctype="Auction Bid",
+			reference_name=row.name,
+		)
+		return
+	frappe.db.set_value("Auction Bid", row.name, "hold_status", RELEASED)
+
+
+def _release_holds(auction: Auction, keep: tuple[str, ...] = (), bidder: str | None = None) -> None:
+	filters: dict[str, Any] = {"auction": auction.name, "hold_status": AUTHORIZED}
+	if bidder:
+		filters["bidder"] = bidder
+	for row in frappe.get_all("Auction Bid", filters=filters, fields=["name", "hold_status", "hold_reference"]):
+		if row.name not in keep:
+			_release(auction, row)
+
+
+# Effects.
+
+
+def _apply(auction: Auction, row: Any, now: datetime) -> dict[str, Any]:
+	"""Gives a checked row its effect. Returns what the buyer should be told beyond the page state (the
+	document a purchase made)."""
+	if row.bid_type == BID:
+		_apply_bid(auction, row, now)
+		return {}
+	if row.bid_type == PURCHASE:
+		return _apply_purchase(auction, row, now)
+	if row.bid_type == BUY_NOW:
+		made = _sell_lot(auction, row, money(row.amount), now)
+		return {made.field: made.name}
+	return _apply_offer(auction, row, now)
+
+
+def _apply_bid(auction: Auction, row: Any, now: datetime) -> None:
+	bids = _bids(auction.name)
+	values: dict[str, Any] = {"bid_count": len(bids), "status": OPEN}
+	if auction.auction_type == rules.ENGLISH:
+		before = english_standing(auction, [bid for bid in bids if bid != _as_bid(row)])
+		standing = english_standing(auction, bids)
+		values["current_price"] = standing.price
+		window = timedelta(minutes=cint(auction.extend_window_minutes))
+		values["ends_at"] = rules.extended_end(get_datetime(auction.ends_at), now, window)
+		if before.leader and before.leader != standing.leader:
+			_release_holds(auction, bidder=before.leader)
+	_update(auction, **values)
+
+
+def _apply_purchase(auction: Auction, row: Any, now: datetime) -> dict[str, Any]:
+	units = _qty(row.qty)
+	made = settle(auction, row, units, money(row.amount))
+	frappe.db.set_value("Auction Bid", row.name, {"is_winner": 1, "units_won": units, made.field: made.name})
+	sold = _qty(auction.units_sold) + units
+	values: dict[str, Any] = {
+		"units_sold": sold,
+		"current_price": money(row.amount),
+		"bid_count": cint(auction.bid_count) + 1,
+		"status": OPEN,
+	}
+	if sold >= _qty(auction.quantity):
+		values.update(status=SOLD, closed_at=now)
+	_update(auction, **values)
+	return {made.field: made.name}
+
+
+def _apply_offer(auction: Auction, row: Any, now: datetime) -> dict[str, Any]:
+	decision = _offer_decision(auction, money(row.amount))
+	_set_pending_offers(auction, rules.OFFER_REPLACED, bidder=row.bidder)
+	frappe.db.set_value("Auction Bid", row.name, "offer_status", decision)
+	row.offer_status = decision
 	_update(auction, bid_count=cint(auction.bid_count) + 1, status=OPEN)
+	if decision == rules.OFFER_DECLINED:
+		_release(auction, row)
 	if decision == rules.OFFER_ACCEPTED:
-		row.db_set("offer_status", rules.OFFER_ACCEPTED)
-		_sell_lot(auction, row.name, user, customer, offer, now)
-	return public_state(auction, user, now)
+		made = _sell_lot(auction, row, money(row.amount), now)
+		return {made.field: made.name}
+	return {}
+
+
+def _sell_lot(auction: Auction, row: Any, price: Decimal, now: datetime) -> settlement.Settlement:
+	"""Sells an English, Sealed or Best Offer lot to one buyer at `price`. Pending offers are declined, and
+	every other hold is released."""
+	made = settle(auction, row, _qty(auction.quantity), price)
+	frappe.db.set_value("Auction Bid", row.name, {"is_winner": 1, made.field: made.name})
+	_set_pending_offers(auction, rules.OFFER_DECLINED)
+	_release_holds(auction, keep=(row.name,))
+	_update(
+		auction,
+		status=SOLD,
+		closed_at=now,
+		current_price=price,
+		winning_bidder=row.bidder,
+		winning_customer=row.customer,
+		**{made.field: made.name},
+	)
+	return made
+
+
+def _set_pending_offers(auction: Auction, status: str, bidder: str | None = None) -> None:
+	filters: dict[str, Any] = {"auction": auction.name, "bid_type": OFFER, "offer_status": rules.OFFER_PENDING}
+	if bidder:
+		filters["bidder"] = bidder
+	for pending in frappe.get_all("Auction Bid", filters=filters, fields=["name", "hold_status", "hold_reference"]):
+		frappe.db.set_value("Auction Bid", pending.name, "offer_status", status)
+		_release(auction, pending)
 
 
 def _pending_offer(bid_name: str) -> tuple[Auction, Any]:
@@ -330,17 +494,21 @@ def _pending_offer(bid_name: str) -> tuple[Auction, Any]:
 
 
 def accept_offer(bid_name: str, now: datetime | None = None) -> str:
-	"""The seller accepts a pending offer: the lot is sold to that buyer at the offer. Returns the Sales
-	Order."""
+	"""The seller accepts a pending offer: the lot is sold to that buyer at the offer. Returns the order or
+	invoice made."""
 	now = now or now_datetime()
 	auction, row = _pending_offer(bid_name)
 	row.db_set("offer_status", rules.OFFER_ACCEPTED)
-	return _sell_lot(auction, row.name, row.bidder, row.customer, money(row.amount), now)
+	return _sell_lot(auction, row, money(row.amount), now).name
 
 
 def decline_offer(bid_name: str) -> None:
-	_auction, row = _pending_offer(bid_name)
+	auction, row = _pending_offer(bid_name)
 	row.db_set("offer_status", rules.OFFER_DECLINED)
+	_release(auction, row)
+
+
+# Closing.
 
 
 def close(name: str, now: datetime | None = None) -> str:
@@ -357,8 +525,7 @@ def close(name: str, now: datetime | None = None) -> str:
 		return status
 	if auction.auction_type == rules.BEST_OFFER:
 		_set_pending_offers(auction, rules.OFFER_EXPIRED)
-		_update(auction, status=UNSOLD, closed_at=now)
-		return UNSOLD
+		return _unsold(auction, now)
 	if auction.auction_type == rules.UNIFORM:
 		return _close_uniform(auction, now)
 	rows = _bid_rows(auction.name)
@@ -368,15 +535,20 @@ def close(name: str, now: datetime | None = None) -> str:
 	else:
 		standing = sealed_standing(auction, bids)
 	if not standing.sells or standing.leader is None or standing.price is None:
-		unsold: dict[str, Any] = {"status": UNSOLD, "closed_at": now}
-		if standing.price is not None:
-			# Currency columns are NOT NULL: an auction with no bids keeps its price as it was.
-			unsold["current_price"] = standing.price
-		_update(auction, **unsold)
-		return UNSOLD
+		return _unsold(auction, now, standing.price)
 	winning = next(row for row in rows if row.bidder == standing.leader and money(row.amount) == standing.leader_amount)
-	_sell_lot(auction, winning.name, winning.bidder, winning.customer, standing.price, now)
+	_sell_lot(auction, winning, standing.price, now)
 	return SOLD
+
+
+def _unsold(auction: Auction, now: datetime, price: Decimal | None = None) -> str:
+	_release_holds(auction)
+	values: dict[str, Any] = {"status": UNSOLD, "closed_at": now}
+	if price is not None:
+		# Currency columns are NOT NULL: an auction with no bids keeps its price as it was.
+		values["current_price"] = price
+	_update(auction, **values)
+	return UNSOLD
 
 
 def _close_uniform(auction: Auction, now: datetime) -> str:
@@ -388,20 +560,16 @@ def _close_uniform(auction: Auction, now: datetime) -> str:
 		_optional_money(auction.reserve_price),
 	)
 	if price is None:
-		_update(auction, status=UNSOLD, closed_at=now)
-		return UNSOLD
+		return _unsold(auction, now)
+	winners: list[str] = []
 	for allocation in won:
-		row = next(
-			r
-			for r in rows
-			if r.bidder == allocation.bid.bidder
-			and money(r.amount) == allocation.bid.amount
-			and get_datetime(r.placed_at) == allocation.bid.placed
-		)
-		sales_order = settle(auction, row.customer, allocation.units, price)
+		row = next(r for r in rows if _as_bid(r) == allocation.bid)
+		made = settle(auction, row, allocation.units, price)
 		frappe.db.set_value(
-			"Auction Bid", row.name, {"is_winner": 1, "units_won": allocation.units, "sales_order": sales_order}
+			"Auction Bid", row.name, {"is_winner": 1, "units_won": allocation.units, made.field: made.name}
 		)
+		winners.append(row.name)
+	_release_holds(auction, keep=tuple(winners))
 	_update(
 		auction,
 		status=SOLD,
@@ -412,9 +580,12 @@ def _close_uniform(auction: Auction, now: datetime) -> str:
 	return SOLD
 
 
+# Settlement.
+
+
 def _as_administrator[T](action: Callable[[], T]) -> T:
-	"""Settlement creates accounting documents the buyer may not create, whoever triggered it (a Dutch
-	buyer's request, or the scheduler)."""
+	"""Settlement creates accounting documents the buyer may not create, whoever triggered it (a buyer's
+	request, a gateway's callback, or the scheduler)."""
 	user = frappe.session.user
 	frappe.set_user("Administrator")
 	try:
@@ -423,53 +594,19 @@ def _as_administrator[T](action: Callable[[], T]) -> T:
 		frappe.set_user(user)
 
 
-def settle(auction: Auction, customer: str, qty: Decimal, rate: Decimal) -> str:
-	"""A submitted Sales Order for the buyer at the auction price, and a Payment Request when the auction
-	names a gateway. Returns the Sales Order's name."""
+def settle(auction: Auction, row: Any, qty: Decimal, rate: Decimal) -> settlement.Settlement:
+	"""The buyer's submitted order or invoice. A held row's hold is captured (up to what it holds) and booked as
+	a Payment Entry; whatever is still owed gets a Payment Request when the auction names a gateway."""
 
-	def make() -> str:
-		today = nowdate()
-		order = frappe.get_doc(
-			{
-				"doctype": "Sales Order",
-				"company": auction.company,
-				"customer": customer,
-				"currency": auction.currency,
-				"order_type": "Shopping Cart",
-				"transaction_date": today,
-				"delivery_date": today,
-				"ignore_pricing_rule": 1,
-				"items": [
-					{
-						"item_code": auction.item,
-						"qty": flt(qty),
-						"rate": flt(rate),
-						"price_list_rate": flt(rate),
-						"delivery_date": today,
-						"warehouse": auction.warehouse,
-					}
-				],
-			}
-		)
-		if auction.taxes_and_charges:
-			from erpnext.controllers.accounts_controller import get_taxes_and_charges
-
-			order.taxes_and_charges = auction.taxes_and_charges
-			order.set("taxes", get_taxes_and_charges("Sales Taxes and Charges Template", auction.taxes_and_charges))
-		order.insert()
-		order.submit()
-		if auction.payment_gateway_account:
-			from erpnext.accounts.doctype.payment_request.payment_request import make_payment_request
-
-			make_payment_request(
-				dt="Sales Order",
-				dn=order.name,
-				payment_gateway_account=auction.payment_gateway_account,
-				submit_doc=1,
-				mute_email=0,
-				order_type="Shopping Cart",
-			)
-		return order.name
+	def make() -> settlement.Settlement:
+		made, document = settlement.create(auction, row.customer, qty, rate)
+		if row.hold_status == AUTHORIZED:
+			amount = min(money(row.hold_amount), money(document.grand_total))
+			transaction_id = holds.capture(auction, row.hold_reference, amount)
+			settlement.book_payment(auction, made, amount, transaction_id)
+			frappe.db.set_value("Auction Bid", row.name, "hold_status", CAPTURED)
+		settlement.request_payment(auction, made)
+		return made
 
 	return _as_administrator(make)
 
@@ -504,9 +641,12 @@ def open_and_close_due(now: datetime | None = None) -> None:
 			frappe.db.commit()
 
 
+# What visitors see.
+
+
 def public_state(auction: Auction, user: str, now: datetime | None = None) -> dict[str, Any]:
-	"""What a visitor may see of an auction now. Sealed bids stay hidden until the close; nobody's identity
-	or maximum is shown except the visitor's own."""
+	"""What a visitor may see of an auction now. Sealed and Uniform Price bids stay hidden until the close;
+	nobody's identity, maximum or offer is shown except the visitor's own."""
 	now = now or now_datetime()
 	starts = get_datetime(auction.starts_at)
 	ends = get_datetime(auction.ends_at)
@@ -519,6 +659,7 @@ def public_state(auction: Auction, user: str, now: datetime | None = None) -> di
 		status = OPEN
 	else:
 		status = "Closing"
+	signed_in = bool(user and user != "Guest")
 	state: dict[str, Any] = {
 		"name": auction.name,
 		"auction_type": auction.auction_type,
@@ -529,21 +670,20 @@ def public_state(auction: Auction, user: str, now: datetime | None = None) -> di
 		"bid_count": cint(auction.bid_count),
 		"seconds_to_start": max(0, int((starts - now).total_seconds())),
 		"seconds_to_end": max(0, int((ends - now).total_seconds())),
-		"signed_in": bool(user and user != "Guest"),
+		"signed_in": signed_in,
+		"payment_timing": auction.payment_timing or AFTER_CLOSE,
 	}
-	signed_in = state["signed_in"]
 	rows = _bid_rows(auction.name, ROW_TYPE.get(auction.auction_type, BID))
 	own = [row for row in rows if row.bidder == user] if signed_in else []
 	your_best = flt(max(row.amount for row in own)) if own else None
 	standing = rules.NO_BIDS
 	if auction.auction_type == rules.ENGLISH:
-		bids = [_as_bid(row) for row in rows]
-		standing = english_standing(auction, bids)
+		standing = english_standing(auction, [_as_bid(row) for row in rows])
 		terms = _terms(auction)
 		state |= {
 			"current_price": flt(standing.price) if standing.price is not None else None,
 			"minimum_bid": flt(rules.english_minimum_bid(standing, terms["start"], terms["increment"])),
-			"you_lead": state["signed_in"] and standing.leader == user,
+			"you_lead": signed_in and standing.leader == user,
 			"your_max": your_best,
 			"reserve_met": standing.reserve_met if terms["reserve"] else None,
 		}
@@ -587,7 +727,21 @@ def public_state(auction: Auction, user: str, now: datetime | None = None) -> di
 		state["buy_now_price"] = flt(price) if available else None
 	if closed and auction.auction_type in (rules.ENGLISH, rules.SEALED, rules.BEST_OFFER):
 		state["you_won"] = signed_in and auction.winning_bidder == user
+	if signed_in and holds_payment(auction):
+		state["your_hold"] = _latest_hold(auction, user)
 	return state
+
+
+def _latest_hold(auction: Auction, user: str) -> dict[str, Any] | None:
+	"""The visitor's newest row's hold, counted or not, so they see one that is waiting or failed."""
+	latest = frappe.get_all(
+		"Auction Bid",
+		filters={"auction": auction.name, "bidder": user},
+		fields=["hold_status", "hold_error"],
+		order_by="placed_at desc, creation desc",
+		limit=1,
+	)
+	return {"status": latest[0].hold_status, "error": latest[0].hold_error} if latest else None
 
 
 def _seconds_to_next_step(auction: Auction, now: datetime) -> int | None:

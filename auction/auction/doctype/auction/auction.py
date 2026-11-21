@@ -6,7 +6,7 @@ from frappe import _
 from frappe.utils import get_datetime
 from frappe.website.website_generator import WebsiteGenerator
 
-from auction import engine, rules
+from auction import engine, holds, rules, settlement
 
 # Once anyone has bid, these are part of the deal the bidders took and can't change.
 TERMS_FIELDS = (
@@ -23,7 +23,11 @@ TERMS_FIELDS = (
 	"price_step",
 	"step_interval_seconds",
 	"starts_at",
+	"settle_as",
+	"payment_timing",
+	"payment_gateway_account",
 )
+SECONDS_PER_DAY = 86400
 ROUTE_SUFFIX_LENGTH = 6
 
 
@@ -42,6 +46,12 @@ class Auction(WebsiteGenerator):
 			frappe.throw(_("Ends At must be after Starts At."))
 		if self.quantity <= 0:
 			frappe.throw(_("Quantity must be more than 0."))
+		if self.settle_as not in settlement.SETTLE_AS:
+			frappe.throw(_("Settle As must be Sales Order or Sales Invoice."))
+		if self.payment_timing not in engine.PAYMENT_TIMINGS:
+			frappe.throw(_("Unknown payment timing {0}.").format(self.payment_timing))
+		if self.payment_timing == engine.AUTHORIZE_AT_BID:
+			self.validate_holds()
 		if self.auction_type == rules.BEST_OFFER:
 			self.validate_best_offer()
 		elif (self.start_price or 0) <= 0:
@@ -65,6 +75,16 @@ class Auction(WebsiteGenerator):
 			if (self.step_interval_seconds or 0) <= 0:
 				frappe.throw(_("Step Interval must be more than 0 seconds."))
 			self.reserve_price = 0
+
+	def validate_holds(self) -> None:
+		provider = holds.require_provider(self.payment_gateway_account)
+		days = (get_datetime(self.ends_at) - get_datetime(self.starts_at)).total_seconds() / SECONDS_PER_DAY
+		if days > provider.max_hold_days:
+			frappe.throw(
+				_("This gateway keeps a hold for {0} days; an Authorize at Bid auction can't run longer.").format(
+					provider.max_hold_days
+				)
+			)
 
 	def validate_best_offer(self) -> None:
 		if (self.buy_now_price or 0) <= 0:

@@ -36,6 +36,8 @@
   "column_break_schedule",
   "ends_at",
   "settlement_section",
+  "settle_as",
+  "payment_timing",
   "taxes_and_charges",
   "column_break_settlement",
   "payment_gateway_account",
@@ -52,6 +54,7 @@
   "winning_bidder",
   "winning_customer",
   "sales_order",
+  "sales_invoice",
   "closed_at",
   "settlement_error"
  ],
@@ -108,7 +111,7 @@
   },
   {
    "default": "1",
-   "description": "English, Sealed and Best Offer: the lot's size, sold together. Dutch and Uniform Price: units on offer; each buyer takes or bids for as many as they choose.",
+   "description": "English, Sealed and Best Offer: the lot's size, sold together. Dutch and Uniform Price: units on offer; each buyer takes or bids for as many as they choose. Every price is a unit price: a lot of 3 sells at 3 × the price.",
    "fieldname": "quantity",
    "fieldtype": "Float",
    "label": "Quantity",
@@ -273,6 +276,24 @@
    "label": "Settlement"
   },
   {
+   "default": "Sales Order",
+   "description": "The document a sale makes for the buyer, submitted.",
+   "fieldname": "settle_as",
+   "fieldtype": "Select",
+   "label": "Settle As",
+   "options": "Sales Order\nSales Invoice",
+   "reqd": 1
+  },
+  {
+   "default": "After Close",
+   "description": "After Close: the buyer pays once they have won (a Payment Request, when a gateway is set). Authorize at Bid: the buyer's card is held for each bid, purchase or offer, captured when they win and released when they are outbid or lose; needs a gateway that can hold payments.",
+   "fieldname": "payment_timing",
+   "fieldtype": "Select",
+   "label": "Payment Timing",
+   "options": "After Close\nAuthorize at Bid",
+   "reqd": 1
+  },
+  {
    "description": "Applied to the winner's Sales Order.",
    "fieldname": "taxes_and_charges",
    "fieldtype": "Link",
@@ -284,11 +305,12 @@
    "fieldtype": "Column Break"
   },
   {
-   "description": "Set: the winner is emailed a Payment Request through this gateway. Blank: no Payment Request; staff collect payment.",
+   "description": "After Close: the buyer is emailed a Payment Request through this gateway (blank: no Payment Request; staff collect payment). Authorize at Bid: the gateway that holds and captures the payment.",
    "fieldname": "payment_gateway_account",
    "fieldtype": "Link",
    "label": "Payment Gateway Account",
-   "options": "Payment Gateway Account"
+   "options": "Payment Gateway Account",
+   "mandatory_depends_on": "eval:doc.payment_timing=='Authorize at Bid'"
   },
   {
    "fieldname": "web_section",
@@ -389,6 +411,15 @@
    "read_only": 1
   },
   {
+   "depends_on": "eval:doc.settle_as=='Sales Invoice' && !['Dutch','Uniform Price'].includes(doc.auction_type)",
+   "fieldname": "sales_invoice",
+   "fieldtype": "Link",
+   "label": "Sales Invoice",
+   "no_copy": 1,
+   "options": "Sales Invoice",
+   "read_only": 1
+  },
+  {
    "fieldname": "closed_at",
    "fieldtype": "Datetime",
    "label": "Closed At",
@@ -414,7 +445,7 @@
    "link_fieldname": "auction"
   }
  ],
- "modified": "2026-11-21 17:00:00.000000",
+ "modified": "2026-11-21 18:00:00.000000",
  "modified_by": "Administrator",
  "module": "Auction",
  "name": "Auction",

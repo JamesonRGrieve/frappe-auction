@@ -20,7 +20,14 @@
   "offer_status",
   "units_won",
   "column_break_result",
-  "sales_order"
+  "sales_order",
+  "sales_invoice",
+  "hold_section",
+  "hold_status",
+  "hold_amount",
+  "column_break_hold",
+  "hold_reference",
+  "hold_error"
  ],
  "fields": [
   {
@@ -139,12 +146,57 @@
    "label": "Sales Order",
    "options": "Sales Order",
    "read_only": 1
+  },
+  {
+   "fieldname": "sales_invoice",
+   "fieldtype": "Link",
+   "label": "Sales Invoice",
+   "options": "Sales Invoice",
+   "read_only": 1
+  },
+  {
+   "fieldname": "hold_section",
+   "fieldtype": "Section Break",
+   "label": "Payment Hold",
+   "depends_on": "eval:doc.hold_status!='Not Required'"
+  },
+  {
+   "default": "Not Required",
+   "fieldname": "hold_status",
+   "fieldtype": "Select",
+   "in_standard_filter": 1,
+   "label": "Hold Status",
+   "options": "Not Required\nAwaiting Authorization\nAuthorized\nReleased\nCaptured\nFailed",
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "hold_amount",
+   "fieldtype": "Currency",
+   "label": "Hold Amount",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_hold",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "hold_reference",
+   "fieldtype": "Data",
+   "label": "Gateway Reference",
+   "read_only": 1
+  },
+  {
+   "fieldname": "hold_error",
+   "fieldtype": "Small Text",
+   "label": "Hold Error",
+   "read_only": 1
   }
  ],
  "in_create": 1,
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-11-21 17:00:00.000000",
+ "modified": "2026-11-21 18:00:00.000000",
  "modified_by": "Administrator",
  "module": "Auction",
  "name": "Auction Bid",

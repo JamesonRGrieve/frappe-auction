@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
+from unittest.mock import patch
 
 import frappe
 from erpnext.tests.utils import ERPNextTestSuite
@@ -20,6 +21,8 @@ from auction.rules import BidRejected
 COMPANY = "_Test Company"
 LOT = "_Test Auction Lot"
 TAX_TEMPLATE = "_Test Sales Taxes and Charges Template - _TC"
+GATEWAY = "_Test Auction Gateway"
+GATEWAY_PAYMENT_ACCOUNT = "_Test Bank - _TC"
 BUYERS = ("ann", "bob", "cat")
 HOUR = timedelta(hours=1)
 
@@ -383,6 +386,177 @@ class TestBestOffer(AuctionTestCase):
 	def test_a_listing_needs_its_asking_price(self) -> None:
 		with self.assertRaises(frappe.ValidationError):
 			self.make(rules.BEST_OFFER, buy_now_price=0)
+
+
+class FakeGateway:
+	"""A payment gateway controller that can hold payments, kept in memory: what a real gateway's
+	authorize/release/capture would do, recorded so tests can check which holds were let go or taken."""
+
+	max_hold_days = 7
+
+	def __init__(self) -> None:
+		self.requested: dict[str, dict[str, Any]] = {}
+		self.released: list[str] = []
+		self.captured: list[tuple[str, float]] = []
+
+	def get_hold_url(self, **kwargs: Any) -> str:
+		self.requested[kwargs["reference_docname"]] = kwargs
+		return f"https://gateway.test/hold/{kwargs['reference_docname']}"
+
+	def release_hold(self, hold_reference: str) -> None:
+		self.released.append(hold_reference)
+
+	def capture_hold(self, hold_reference: str, amount: float) -> str:
+		self.captured.append((hold_reference, amount))
+		return f"txn-{hold_reference}"
+
+
+class TestHolds(AuctionTestCase):
+	def setUp(self) -> None:
+		super().setUp()
+		if not frappe.db.exists("Payment Gateway", GATEWAY):
+			frappe.get_doc({"doctype": "Payment Gateway", "gateway": GATEWAY}).insert(ignore_permissions=True)
+		account = frappe.db.get_value("Payment Gateway Account", {"payment_gateway": GATEWAY})
+		if not account:
+			account = (
+				frappe.get_doc(
+					{
+						"doctype": "Payment Gateway Account",
+						"payment_gateway": GATEWAY,
+						"payment_account": GATEWAY_PAYMENT_ACCOUNT,
+						"company": COMPANY,
+					}
+				)
+				.insert(ignore_permissions=True)
+				.name
+			)
+		self.account = account
+		frappe.db.commit()
+		self.gateway = FakeGateway()
+		patcher = patch("auction.holds.provider_for", return_value=self.gateway)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
+	def held(self, auction_type: str, **values: Any) -> Any:
+		return self.make(
+			auction_type, payment_timing=engine.AUTHORIZE_AT_BID, payment_gateway_account=self.account, **values
+		)
+
+	def row(self, auction: Any, buyer: str) -> Any:
+		names = frappe.get_all(
+			"Auction Bid",
+			filters={"auction": auction.name, "bidder": user(buyer)},
+			pluck="name",
+			order_by="placed_at desc, creation desc",
+		)
+		return frappe.get_doc("Auction Bid", names[0])
+
+	def authorize(self, auction: Any, buyer: str, at: datetime | None = None) -> Any:
+		row = self.row(auction, buyer)
+		engine.hold_authorized(row.name, f"ref-{buyer}", at or self.now)
+		return frappe.get_doc("Auction Bid", row.name)
+
+	def test_a_bid_counts_once_its_hold_is_authorized_and_the_winner_is_charged(self) -> None:
+		auction = self.held(rules.ENGLISH)
+		state = self.bid(auction, "ann", "50")
+		row = self.row(auction, "ann")
+		self.assertEqual(state["authorize_url"], f"https://gateway.test/hold/{row.name}")
+		self.assertEqual((row.hold_status, row.hold_amount), (engine.AWAITING, 50))
+		self.assertEqual(self.gateway.requested[row.name]["amount"], 50)
+		self.assertEqual(engine.public_state(self.reload(auction), user("ann"), self.now)["bid_count"], 0)
+
+		self.assertEqual(self.authorize(auction, "ann").hold_status, engine.AUTHORIZED)
+		self.bid(auction, "bob", "60")
+		self.authorize(auction, "bob")
+		self.assertEqual(self.gateway.released, ["ref-ann"])
+		self.assertEqual(self.row(auction, "ann").hold_status, engine.RELEASED)
+
+		engine.close(auction.name, self.now + 2 * HOUR)
+		auction = self.reload(auction)
+		self.assertEqual((auction.winning_bidder, auction.current_price), (user("bob"), 51))
+		self.assertEqual(self.gateway.captured, [("ref-bob", 51.0)])
+		self.assertEqual(self.row(auction, "bob").hold_status, engine.CAPTURED)
+		order = self.order(auction.sales_order)
+		self.assertEqual(order.advance_paid, 51)
+		entry = frappe.get_all(
+			"Payment Entry Reference",
+			filters={"reference_name": order.name, "docstatus": 1},
+			fields=["parent", "allocated_amount"],
+		)
+		self.assertEqual([e.allocated_amount for e in entry], [51])
+
+	def test_a_bid_overtaken_while_authorizing_fails_and_its_hold_is_released(self) -> None:
+		auction = self.held(rules.ENGLISH)
+		# The start price is a valid first bid; once bob's bid counts, the lowest bid is 11.
+		self.bid(auction, "ann", "10")
+		self.bid(auction, "bob", "30")
+		self.authorize(auction, "bob")
+		ann = self.authorize(auction, "ann")
+		self.assertEqual(ann.hold_status, engine.FAILED)
+		self.assertIn("lowest bid", ann.hold_error)
+		self.assertEqual(self.gateway.released, ["ref-ann"])
+		state = engine.public_state(self.reload(auction), user("ann"), self.now)
+		self.assertEqual(state["your_hold"]["status"], engine.FAILED)
+		self.assertEqual(state["bid_count"], 1)
+
+	def test_a_refused_card_leaves_the_bid_uncounted(self) -> None:
+		auction = self.held(rules.SEALED)
+		self.bid(auction, "ann", "40")
+		engine.hold_failed(self.row(auction, "ann").name, "Card declined")
+		self.assertEqual(self.row(auction, "ann").hold_status, engine.FAILED)
+		self.assertEqual(engine.close(auction.name, self.now + 2 * HOUR), engine.UNSOLD)
+
+	def test_a_gateway_reporting_twice_changes_nothing_the_second_time(self) -> None:
+		auction = self.held(rules.ENGLISH)
+		self.bid(auction, "ann", "20")
+		self.authorize(auction, "ann")
+		self.authorize(auction, "ann")
+		self.assertEqual(self.reload(auction).bid_count, 1)
+
+	def test_losing_sealed_bids_are_released_at_the_close(self) -> None:
+		auction = self.held(rules.SEALED)
+		for buyer, amount in (("ann", "50"), ("bob", "40"), ("cat", "30")):
+			self.bid(auction, buyer, amount)
+			self.authorize(auction, buyer)
+		engine.close(auction.name, self.now + 2 * HOUR)
+		self.assertEqual(sorted(self.gateway.released), ["ref-bob", "ref-cat"])
+		self.assertEqual(self.gateway.captured, [("ref-ann", 40.0)])
+
+	def test_buy_now_takes_effect_when_authorized(self) -> None:
+		auction = self.held(rules.ENGLISH, buy_now_price=80)
+		engine.buy_now(auction.name, user("ann"), self.now)
+		self.assertEqual(self.reload(auction).status, engine.SCHEDULED)
+		self.authorize(auction, "ann")
+		self.assertEqual(self.reload(auction).status, engine.SOLD)
+		self.assertEqual(self.gateway.captured, [("ref-ann", 80.0)])
+
+	def test_an_auction_longer_than_the_gateway_holds_is_refused(self) -> None:
+		with self.assertRaisesRegex(frappe.ValidationError, "7 days"):
+			self.held(rules.ENGLISH, ends_at=self.now + timedelta(days=8))
+
+	def test_a_gateway_that_cant_hold_is_refused(self) -> None:
+		with patch("auction.holds.provider_for", return_value=None):
+			with self.assertRaisesRegex(frappe.ValidationError, "can't hold"):
+				self.held(rules.ENGLISH)
+
+
+class TestSettleAs(AuctionTestCase):
+	def test_a_win_can_end_in_a_submitted_sales_invoice(self) -> None:
+		auction = self.make(rules.ENGLISH, settle_as="Sales Invoice")
+		self.bid(auction, "ann", "40")
+		engine.close(auction.name, self.now + 2 * HOUR)
+		auction = self.reload(auction)
+		self.assertFalse(auction.sales_order)
+		invoice = frappe.get_doc("Sales Invoice", auction.sales_invoice)
+		self.assertEqual((invoice.docstatus, invoice.customer), (1, customer("ann")))
+		self.assertEqual((invoice.items[0].item_code, invoice.items[0].rate), (LOT, 10))
+		winner = frappe.get_all("Auction Bid", filters={"auction": auction.name, "is_winner": 1}, pluck="sales_invoice")
+		self.assertEqual(winner, [invoice.name])
+
+	def test_dutch_purchases_return_their_invoice(self) -> None:
+		auction = self.make(rules.DUTCH, settle_as="Sales Invoice")
+		state = engine.accept_price(auction.name, "1", user("ann"), self.now)
+		self.assertEqual(frappe.db.get_value("Sales Invoice", state["sales_invoice"], "docstatus"), 1)
 
 
 class TestOpenAndClose(AuctionTestCase):

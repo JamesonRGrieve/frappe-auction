@@ -18,17 +18,36 @@ first bid, or, with a reserve, until the reserve is met. On Sealed it lasts unti
 Equal bids go to whoever bid first. A **reserve** (English and Sealed) is never shown. When an English leader's
 maximum reaches it, the price rises to the reserve. If no bid reaches it, the lot goes unsold.
 
+Every price is a unit price: a lot of 3 sells at 3 × the price.
+
 ## Settlement
 
 When an English, Sealed or Uniform Price auction ends (checked every minute), or a buyer buys (Dutch, Buy It
 Now) or has an offer accepted, the app:
 
-1. creates and submits a **Sales Order** for each buyer's Customer, at the auction price, with the auction's
-   Sales Taxes and Charges Template;
-2. creates a **Payment Request** and emails it to the buyer, if the auction names a Payment Gateway Account.
-   With no gateway, staff collect payment from the Sales Order.
+1. creates and submits a **Sales Order**, or a **Sales Invoice** when the auction's **Settle As** says so, for
+   each buyer's Customer, at the auction price, with the auction's Sales Taxes and Charges Template (an invoice
+   doesn't update stock; a Delivery Note does, as after an order);
+2. with **Authorize at Bid**, captures the buyer's card hold (up to what it holds) and books it as a submitted
+   Payment Entry against that order or invoice;
+3. creates a **Payment Request** for whatever is still owed and emails it to the buyer, if the auction names a
+   Payment Gateway Account. With no gateway, staff collect payment.
 
-The winner pays after the close. Payment isn't authorized when the bid is placed.
+### Payment timing
+
+- **After Close** (the default): the buyer pays once they have won, through the Payment Request. Works with any
+  gateway.
+- **Authorize at Bid**: each bid, purchase or offer first holds its amount (price × units; an English bid holds
+  its maximum) on the buyer's card. It doesn't count until the gateway reports the hold, and it is judged again
+  then: a bid overtaken while the buyer was authorizing fails and is released. Holds are released when a bidder is
+  outbid (English), loses at the close, or their offer is declined, replaced or expires. The winner's hold is
+  captured at the price. The auction can't run longer than the gateway keeps a hold.
+
+Holds go through the `payments` app's gateways and name none of them. A gateway can hold when its controller (the
+document `payments.utils.get_payment_gateway_controller` returns) has `max_hold_days`, `get_hold_url(...)`,
+`release_hold(reference)` and `capture_hold(reference, amount)`. When it holds or refuses, it calls back
+`auction.engine.hold_authorized(bid, reference)` or `auction.engine.hold_failed(bid, reason)`. The full contract is
+in `auction/holds.py`. A gateway without those members offers After Close only.
 
 A buyer must be signed in. Their Customer is the one their account is a portal user of. With the webshop
 installed, a buyer with no Customer gets one the way the webshop's checkout does it. Otherwise the bid is refused
@@ -50,6 +69,8 @@ the next minute settles it.
 | File | What |
 |---|---|
 | `auction/rules.py` | The five formats as pure functions over bids: standings, minimum bids, anti-sniping, the Dutch clock, sealed pricing, uniform-price allocation, Buy It Now availability, offer thresholds. |
+| `auction/settlement.py` | The documents a sale makes: order or invoice, Payment Entry for a captured hold, Payment Request for the rest. |
+| `auction/holds.py` | The gateway hold contract and its calls. |
 | `auction/engine.py` | Applies the rules to the database: `place_bid`, `accept_price`, `buy_now`, `make_offer`, `accept_offer`, `decline_offer`, `close`, `settle`, the per-minute `open_and_close_due` and `public_state`. |
 | `auction/api.py` | The whitelisted methods the web page calls, and the seller's offer answers (Sales Manager, System Manager). |
 | `Auction` | A WebsiteGenerator: the lot, its format and terms, schedule, settlement settings, and status. Route `auctions/<title>-<id>`. |
@@ -64,14 +85,17 @@ tools/test-bench.sh test                           # the whole suite, on the wor
 tools/test-bench.sh down
 ```
 
-Run the bench on a build runner, never a desktop. `BENCH_PORT_BASE` picks the three ports it uses (MariaDB, Redis,
+The bench installs the `payments` app (version-16) when the image lacks it. Run the bench on a build runner,
+never a desktop. `BENCH_PORT_BASE` picks the three ports it uses (MariaDB, Redis,
 desk). `BENCH_IMAGES` names a directory of saved images (`erpnext_v16.36.1.tar`, `mariadb_11.8.tar`,
 `redis_7-alpine.tar`); on the build runners they are in `/var/cache/runner/images/erpnext-v16.36.1`. Without it
 podman pulls the images itself.
 
 ## Not done yet
 
-- Payment Requests are written but not exercised by a test (that needs a payment gateway on the test bench).
+- The Payment Request path (After Close with a gateway) isn't exercised by a test; holds are, against an
+  in-memory gateway.
+- No gateway implements the hold contract yet (frappe-payment-square and frappe-payment-helcim are candidates).
 - No second-chance offer to the runner-up when a winner doesn't pay.
 - Staff can read sealed bids in the desk before the close.
 - A buyer isn't emailed when their offer is declined; the auction page shows it.

@@ -161,6 +161,16 @@
 		if (state.your_offer) own.push(`${t("Your offer")}: ${money(state.your_offer)} (${t(state.your_offer_status)})`);
 		if (state.you_bought) own.push(`${t("You bought")} ${state.you_bought}`);
 		if (state.you_won) own.push(t("You won. Your order and payment details are on their way."));
+		if (state.your_hold) {
+			const hold = {
+				"Awaiting Authorization": t("Your card hasn't authorized this yet; it doesn't count until it does."),
+				Authorized: t("Your card is authorized for this."),
+				Released: t("Your card hold has been released."),
+				Captured: t("Your card has been charged."),
+				Failed: `${t("Your card hold failed")}: ${state.your_hold.error || ""}`,
+			}[state.your_hold.status];
+			if (hold) own.push(hold);
+		}
 		el("own").textContent = own.join(" ");
 	};
 
@@ -178,6 +188,11 @@
 		return frappe
 			.call({ method, args: { auction: root.dataset.auction, ...args }, type: "POST" })
 			.then((r) => {
+				if (r.message && r.message.authorize_url) {
+					// Authorize at Bid: the gateway holds the amount, then sends the buyer back here.
+					window.location.assign(r.message.authorize_url);
+					return;
+				}
 				if (r.message) {
 					state = r.message;
 					loadedAt = Date.now();
