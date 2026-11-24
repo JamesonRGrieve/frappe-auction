@@ -6,6 +6,7 @@ from __future__ import annotations
 import frappe
 from frappe import _
 
+from auction import stores
 from auction.engine import CLOSED_STATUSES
 
 no_cache = 1
@@ -16,7 +17,7 @@ def get_context(context: frappe._dict) -> None:
 	context.title = _("Auctions")
 	context.auctions = frappe.get_all(
 		"Auction",
-		filters={"published": 1, "status": ["not in", CLOSED_STATUSES]},
+		filters={"published": 1, "status": ["not in", CLOSED_STATUSES], **stores.filters()},
 		fields=FIELDS,
 		order_by="ends_at asc",
 	)

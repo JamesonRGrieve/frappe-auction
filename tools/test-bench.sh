@@ -56,16 +56,26 @@ main() {
 		pod exec -i -w /home/frappe/frappe-bench "$bench" "$@"
 	}
 
-	# The working tree (tracked and untracked files, nothing ignored) replaces the app's source in the bench. A file
+	# A working tree (tracked and untracked files, nothing ignored) replaces an app's source in the bench. A file
 	# deleted but not yet committed is still listed by git; tar skips it.
-	copy_app() {
-		pod exec -u root "$bench" mkdir -p "$app_dir"
-		git -C "$root" ls-files -z --cached --others --exclude-standard \
-			| tar -C "$root" --null --ignore-failed-read -T - -cf - \
-			| pod exec -i -u root "$bench" tar -C "$app_dir" -xf -
+	copy_tree() {
+		local source="$1" target="$2"
+		pod exec -u root "$bench" mkdir -p "$target"
+		git -C "$source" ls-files -z --cached --others --exclude-standard \
+			| tar -C "$source" --null --ignore-failed-read -T - -cf - \
+			| pod exec -i -u root "$bench" tar -C "$target" -xf -
 		# The frappe user's group is named differently across ERPNext images; use its ids.
-		pod exec -u root "$bench" sh -c "chown -R \"\$(id -u frappe):\$(id -g frappe)\" '$app_dir'"
+		pod exec -u root "$bench" sh -c "chown -R \"\$(id -u frappe):\$(id -g frappe)\" '$target'"
 	}
+
+	copy_app() {
+		copy_tree "$root" "$app_dir"
+	}
+
+	# BENCH_EXTRA_APPS: space-separated name=path pairs (e.g. webshop=/home/jameson/Source/frappe-webshop), each a
+	# working tree installed on the site before the app under test.
+	local -a extra_apps
+	read -ra extra_apps <<<"${BENCH_EXTRA_APPS:-}"
 
 	mkdir -p "$podman_root"
 	export TMPDIR="$podman_root/tmp"
@@ -125,6 +135,14 @@ main() {
 		in_bench bench new-site "$site" --mariadb-root-password "$db_root_password" \
 			--admin-password "$admin_password" --mariadb-user-host-login-scope='%' --install-app erpnext
 		in_bench bench --site "$site" install-app payments
+		local extra name
+		for extra in "${extra_apps[@]}"; do
+			name="${extra%%=*}"
+			copy_tree "${extra#*=}" "/home/frappe/frappe-bench/apps/$name"
+			in_bench ./env/bin/python -m pip install --quiet -e "apps/$name"
+			in_bench bash -c "grep -qx $name sites/apps.txt || printf '\\n%s\\n' $name >> sites/apps.txt"
+			in_bench bench --site "$site" install-app "$name"
+		done
 		in_bench bench --site "$site" install-app "$app"
 		in_bench bench --site "$site" set-config allow_tests true
 		# The image keeps its built assets beside sites/, which is a volume; pages need the link to find them.

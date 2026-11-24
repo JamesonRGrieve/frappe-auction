@@ -18,19 +18,24 @@ from auction.tests.test_engine import HOUR, AuctionTestCase, ensure_gateway_acco
 OK = 200
 
 
+def render_page(path: str, as_user: str = "Guest") -> tuple[int, str]:
+	"""(status, body) of a GET of `path` through Frappe's website stack, as `as_user`."""
+	frappe.set_user(as_user)
+	try:
+		set_request(method="GET", path=path)
+		# A real request fills form_dict from the query string; the test request doesn't.
+		frappe.local.form_dict = frappe._dict(parse_qsl(urlsplit(path).query))
+		response = get_response(urlsplit(path).path)
+		return response.status_code, response.get_data(as_text=True)
+	finally:
+		frappe.set_user("Administrator")
+
+
 class TestPages(AuctionTestCase):
 	def render(self, path: str, as_user: str = "Guest") -> str:
-		frappe.set_user(as_user)
-		try:
-			set_request(method="GET", path=path)
-			# A real request fills form_dict from the query string; the test request doesn't.
-			frappe.local.form_dict = frappe._dict(parse_qsl(urlsplit(path).query))
-			response = get_response(urlsplit(path).path)
-			body = response.get_data(as_text=True)
-			self.assertEqual(response.status_code, OK, f"{path} as {as_user}: {body[:2000]}")
-			return body
-		finally:
-			frappe.set_user("Administrator")
+		status, body = render_page(path, as_user)
+		self.assertEqual(status, OK, f"{path} as {as_user}: {body[:2000]}")
+		return body
 
 	def test_the_list_shows_open_auctions(self) -> None:
 		auction = self.make(rules.ENGLISH, title="Listed lot")

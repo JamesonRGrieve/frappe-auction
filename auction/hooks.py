@@ -11,5 +11,9 @@ app_version = _version
 
 required_apps = ["frappe", "erpnext"]
 
+# Auction.webshop_store, once the webshop's stores exist (auction.stores).
+after_install = "auction.stores.ensure_field"
+after_migrate = "auction.stores.ensure_field"
+
 # Opens auctions whose start has come and settles those whose end has passed.
 scheduler_events = {"cron": {"* * * * *": ["auction.engine.open_and_close_due"]}}

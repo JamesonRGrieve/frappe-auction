@@ -12,7 +12,7 @@ from typing import Any
 import frappe
 from frappe import _
 
-from auction import engine, holds
+from auction import engine, holds, stores
 from auction.gateways.base import HoldRefused
 from auction.rules import BidRejected
 
@@ -23,6 +23,7 @@ def _published(name: str) -> Any:
 	auction = frappe.get_doc("Auction", name)
 	if not auction.published:
 		raise frappe.DoesNotExistError
+	stores.require_visible(auction)
 	return auction
 
 
@@ -90,6 +91,7 @@ def confirm_hold(bid: str, **payload: Any) -> dict[str, Any]:
 	if row.bidder != frappe.session.user:
 		raise frappe.PermissionError
 	auction = frappe.get_doc("Auction", row.auction)
+	stores.require_visible(auction)
 	adapter = holds.require_provider(auction.payment_gateway_account)
 	hold = holds.hold_request(auction, row)
 	try:

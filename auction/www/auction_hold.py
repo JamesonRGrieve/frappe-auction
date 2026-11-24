@@ -8,7 +8,7 @@ from __future__ import annotations
 import frappe
 from frappe import _
 
-from auction import engine, holds
+from auction import engine, holds, stores
 
 no_cache = 1
 
@@ -21,6 +21,7 @@ def get_context(context: frappe._dict) -> None:
 	if row.bidder != frappe.session.user:
 		raise frappe.PermissionError
 	auction = frappe.get_doc("Auction", row.auction)
+	stores.require_visible(auction)
 	context.title = _("Authorize your card")
 	context.auction = auction
 	context.row = row

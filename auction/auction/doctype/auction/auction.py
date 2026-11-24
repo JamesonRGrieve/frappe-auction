@@ -6,7 +6,7 @@ from frappe import _
 from frappe.utils import get_datetime
 from frappe.website.website_generator import WebsiteGenerator
 
-from auction import engine, holds, rules, settlement
+from auction import engine, holds, rules, settlement, stores
 
 # Once anyone has bid, these are part of the deal the bidders took and can't change.
 TERMS_FIELDS = (
@@ -26,6 +26,7 @@ TERMS_FIELDS = (
 	"settle_as",
 	"payment_timing",
 	"payment_gateway_account",
+	stores.FIELD,
 )
 SECONDS_PER_DAY = 86400
 ROUTE_SUFFIX_LENGTH = 6
@@ -39,6 +40,7 @@ class Auction(WebsiteGenerator):
 
 	def validate(self) -> None:
 		self.validate_terms()
+		stores.validate(self)
 		self.validate_locked_terms()
 		super().validate()
 
@@ -113,6 +115,8 @@ class Auction(WebsiteGenerator):
 		return f"{ROUTE_PREFIX}/{self.scrubbed_title()}-{self.name[:ROUTE_SUFFIX_LENGTH]}"
 
 	def get_context(self, context: frappe._dict) -> None:
+		if not stores.visible(self):
+			raise frappe.PageDoesNotExistError
 		context.no_cache = 1
 		context.state = engine.public_state(self, frappe.session.user)
 		context.parents = [{"route": "auctions", "title": _("Auctions")}]
